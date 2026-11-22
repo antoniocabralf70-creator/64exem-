@@ -1,0 +1,2745 @@
+name: Build APK
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - name: Preparar Android SDK (usar SDK da maquina)
+        run: |
+          set +e
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT"
+          if [ -z "$ANDROID_HOME" ]; then
+            export ANDROID_HOME="${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}"
+            echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
+          fi
+          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          if [ ! -x "$SDKMANAGER" ]; then
+            SDKMANAGER="$(find "$ANDROID_HOME/cmdline-tools" -type f -name sdkmanager 2>/dev/null | sort -V | tail -n 1)"
+          fi
+          if [ -x "$SDKMANAGER" ]; then
+            yes | "$SDKMANAGER" --licenses >/dev/null 2>&1 || true
+            "$SDKMANAGER" --install "platforms;android-34" "build-tools;34.0.0" "ndk;26.1.10909125" "cmake;3.22.1" || true
+          else
+            echo "sdkmanager indisponivel; usando os componentes Android ja instalados no runner."
+          fi
+          echo "NDKs instalados:"
+          ls -1 "$ANDROID_HOME/ndk" 2>/dev/null || true
+          echo "Versoes do CMake instaladas:"
+          ls -1 "$ANDROID_HOME/cmake" 2>/dev/null || true
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+      - name: Gerar projeto 64exem
+        run: |
+          set -e
+          mkdir -p app
+          mkdir -p app/src/main
+          mkdir -p app/src/main/cpp
+          mkdir -p app/src/main/java/dev/n64emu/app
+          mkdir -p app/src/main/res/drawable
+          mkdir -p app/src/main/res/mipmap-anydpi-v26
+          mkdir -p app/src/main/res/values
+          cat > app/build.gradle.kts <<'N64EMU_EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "dev.n64emu.app"
+              compileSdk = 34
+              ndkVersion = "26.1.10909125"
+              defaultConfig {
+                  applicationId = "dev.n64emu.app"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 2
+                  versionName = "0.3.0"
+                  ndk { abiFilters += listOf("arm64-v8a") }
+                  externalNativeBuild { cmake { cppFlags += "-std=c++17" } }
+              }
+              externalNativeBuild { cmake { path = file("src/main/cpp/CMakeLists.txt"); version = "3.22.1" } }
+              packaging { jniLibs { useLegacyPackaging = true } }
+              buildTypes { release { isMinifyEnabled = false } }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          dependencies {
+              implementation("androidx.core:core-ktx:1.13.1")
+              implementation("androidx.appcompat:appcompat:1.7.0")
+          }
+          N64EMU_EOF
+          cat > app/src/main/AndroidManifest.xml <<'N64EMU_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-feature android:glEsVersion="0x00030000" android:required="true" />
+              <application
+                  android:label="64exem"
+                  android:icon="@mipmap/ic_launcher"
+                  android:roundIcon="@mipmap/ic_launcher"
+                  android:theme="@style/Theme.AppCompat.DayNight.NoActionBar">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+                  <activity android:name=".EmulatorActivity"
+                      android:screenOrientation="landscape"
+                      android:configChanges="orientation|screenSize|keyboardHidden" />
+                  <activity android:name=".ControlsEditorActivity"
+                      android:screenOrientation="landscape"
+                      android:configChanges="orientation|screenSize|keyboardHidden" />
+              </application>
+          </manifest>
+          N64EMU_EOF
+          cat > app/src/main/cpp/CMakeLists.txt <<'N64EMU_EOF'
+          cmake_minimum_required(VERSION 3.22)
+          project(n64emu)
+
+          # libretro.h é baixado pelo CI para app/src/main/cpp/include
+          add_library(n64emu SHARED native-lib.cpp)
+          target_include_directories(n64emu PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+          target_link_libraries(n64emu android log EGL GLESv3 aaudio dl)
+          N64EMU_EOF
+          cat > app/src/main/cpp/native-lib.cpp <<'N64EMU_EOF'
+          // Host libretro: carrega o núcleo mupen64plus_next (GLideN64) e roda a ROM.
+          #include <jni.h>
+          #include <android/log.h>
+          #include <android/native_window_jni.h>
+          #include <aaudio/AAudio.h>
+          #include <EGL/egl.h>
+          #include <GLES3/gl3.h>
+          #include <dlfcn.h>
+          #include <unistd.h>
+          #include <atomic>
+          #include <condition_variable>
+          #include <cstdarg>
+          #include <cstdio>
+          #include <cstring>
+          #include <map>
+          #include <mutex>
+          #include <set>
+          #include <string>
+          #include <thread>
+          #include <vector>
+          #include "libretro.h"
+
+          #define TAG "N64Emu"
+
+          namespace {
+
+          FILE* g_logf = nullptr;
+          std::mutex g_logMutex;
+          std::string g_status;
+          std::mutex g_statusMutex;
+
+          void logm(int prio, const char* tag, const char* fmt, ...) {
+              char buf[1024];
+              va_list ap;
+              va_start(ap, fmt);
+              vsnprintf(buf, sizeof(buf), fmt, ap);
+              va_end(ap);
+              __android_log_write(prio, tag, buf);
+              std::lock_guard<std::mutex> l(g_logMutex);
+              if (g_logf) { fprintf(g_logf, "[%s] %s\n", tag, buf); fflush(g_logf); }
+          }
+          #define LOGI(...) logm(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
+          #define LOGE(...) logm(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
+
+          void setStatus(const std::string& s) {
+              std::lock_guard<std::mutex> l(g_statusMutex);
+              g_status = s;
+              if (s.rfind("ERRO", 0) == 0) LOGE("%s", s.c_str());
+          }
+
+          void* g_lib = nullptr;
+          void (*p_set_environment)(retro_environment_t);
+          void (*p_set_video_refresh)(retro_video_refresh_t);
+          void (*p_set_audio_sample)(retro_audio_sample_t);
+          void (*p_set_audio_batch)(retro_audio_sample_batch_t);
+          void (*p_set_input_poll)(retro_input_poll_t);
+          void (*p_set_input_state)(retro_input_state_t);
+          void (*p_init)(void);
+          void (*p_deinit)(void);
+          void (*p_get_system_info)(struct retro_system_info*);
+          void (*p_get_av_info)(struct retro_system_av_info*);
+          bool (*p_load_game)(const struct retro_game_info*);
+          void (*p_unload_game)(void);
+          void (*p_run)(void);
+          void* (*p_get_memory_data)(unsigned) = nullptr;
+          size_t (*p_get_memory_size)(unsigned) = nullptr;
+
+          std::string g_libPath, g_systemDir, g_saveDir;
+          std::string g_saveName;               // nome base do save (sem extensão), definido pelo Java
+          std::vector<uint8_t> g_lastSram;      // última cópia gravada, para saber se mudou
+          std::map<std::string, std::string> g_options;
+          std::mutex g_optMutex;
+          std::atomic<bool> g_optionsDirty{true};
+
+          std::atomic<bool> g_running{false};
+          std::atomic<bool> g_paused{false};
+          std::thread g_thread;
+          std::mutex g_pauseMutex;
+          std::condition_variable g_pauseCv;
+          ANativeWindow* g_window = nullptr;
+
+          EGLDisplay g_dpy = EGL_NO_DISPLAY;
+          EGLSurface g_surf = EGL_NO_SURFACE;
+          EGLContext g_ctx = EGL_NO_CONTEXT;
+          retro_hw_render_callback g_hw{};
+          GLuint g_fbo = 0, g_tex = 0, g_rbo = 0;
+          unsigned g_fboW = 0, g_fboH = 0;
+          unsigned g_frameW = 0, g_frameH = 0;
+          float g_aspect = 4.0f / 3.0f;
+          int g_sampleRate = 44100;
+          bool g_firstFrame = true;
+
+          AAudioStream* g_audio = nullptr;
+          std::atomic<int> g_buttons{0};
+          std::atomic<int> g_axes[4] = {};
+
+          #define LOAD(var, name)                                   \
+              var = (decltype(var))dlsym(g_lib, name);              \
+              if (!var) { LOGE("simbolo ausente: %s", name); return false; }
+
+          bool loadCore() {
+              g_lib = dlopen(g_libPath.c_str(), RTLD_NOW | RTLD_LOCAL);
+              if (!g_lib) { LOGE("dlopen falhou: %s", dlerror()); return false; }
+              LOAD(p_set_environment, "retro_set_environment");
+              LOAD(p_set_video_refresh, "retro_set_video_refresh");
+              LOAD(p_set_audio_sample, "retro_set_audio_sample");
+              LOAD(p_set_audio_batch, "retro_set_audio_sample_batch");
+              LOAD(p_set_input_poll, "retro_set_input_poll");
+              LOAD(p_set_input_state, "retro_set_input_state");
+              LOAD(p_init, "retro_init");
+              LOAD(p_deinit, "retro_deinit");
+              LOAD(p_get_system_info, "retro_get_system_info");
+              LOAD(p_get_av_info, "retro_get_system_av_info");
+              LOAD(p_load_game, "retro_load_game");
+              LOAD(p_unload_game, "retro_unload_game");
+              LOAD(p_run, "retro_run");
+              p_get_memory_data = (decltype(p_get_memory_data))dlsym(g_lib, "retro_get_memory_data");
+              p_get_memory_size = (decltype(p_get_memory_size))dlsym(g_lib, "retro_get_memory_size");
+              return true;
+          }
+
+          // ---------- FBO ----------
+          void createFbo(unsigned w, unsigned h) {
+              glGenFramebuffers(1, &g_fbo);
+              glGenTextures(1, &g_tex);
+              glGenRenderbuffers(1, &g_rbo);
+              glBindTexture(GL_TEXTURE_2D, g_tex);
+              glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+              glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+              glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+              glBindRenderbuffer(GL_RENDERBUFFER, g_rbo);
+              glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, w, h);
+              glBindFramebuffer(GL_FRAMEBUFFER, g_fbo);
+              glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, g_tex, 0);
+              glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER, g_rbo);
+              g_fboW = w; g_fboH = h;
+              LOGI("FBO %ux%u status=0x%x", w, h, glCheckFramebufferStatus(GL_FRAMEBUFFER));
+          }
+          void resizeFbo(unsigned w, unsigned h) {
+              if (!g_fbo) return;
+              if (w <= g_fboW && h <= g_fboH) return;
+              if (w < g_fboW) w = g_fboW;
+              if (h < g_fboH) h = g_fboH;
+              glBindTexture(GL_TEXTURE_2D, g_tex);
+              glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+              glBindRenderbuffer(GL_RENDERBUFFER, g_rbo);
+              glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, w, h);
+              g_fboW = w; g_fboH = h;
+              LOGI("FBO redimensionado %ux%u", w, h);
+          }
+          void destroyFbo() {
+              if (g_fbo) glDeleteFramebuffers(1, &g_fbo);
+              if (g_tex) glDeleteTextures(1, &g_tex);
+              if (g_rbo) glDeleteRenderbuffers(1, &g_rbo);
+              g_fbo = g_tex = g_rbo = 0;
+              g_fboW = g_fboH = 0;
+          }
+
+          // ---------- callbacks ----------
+          void logCb(enum retro_log_level level, const char* fmt, ...) {
+              char buf[1024];
+              va_list ap;
+              va_start(ap, fmt);
+              vsnprintf(buf, sizeof(buf), fmt, ap);
+              va_end(ap);
+              size_t n = strlen(buf);
+              while (n > 0 && (buf[n - 1] == '\n' || buf[n - 1] == '\r')) buf[--n] = 0;
+              int prio = level == RETRO_LOG_ERROR ? ANDROID_LOG_ERROR
+                       : level == RETRO_LOG_WARN  ? ANDROID_LOG_WARN
+                       : level == RETRO_LOG_INFO  ? ANDROID_LOG_INFO : ANDROID_LOG_DEBUG;
+              logm(prio, "N64Core", "%s", buf);
+          }
+
+          uintptr_t getCurrentFb() { return (uintptr_t)g_fbo; }
+          retro_proc_address_t getProc(const char* sym) {
+              void* p = (void*)eglGetProcAddress(sym);
+              if (!p) p = dlsym(RTLD_DEFAULT, sym);
+              return (retro_proc_address_t)p;
+          }
+
+          void updateAspect(const retro_game_geometry& g) {
+              if (g.aspect_ratio > 0) g_aspect = g.aspect_ratio;
+              else if (g.base_height) g_aspect = (float)g.base_width / (float)g.base_height;
+          }
+
+          bool envCb(unsigned cmd, void* data) {
+              static std::set<unsigned> seen;
+              switch (cmd) {
+                  case RETRO_ENVIRONMENT_GET_CAN_DUPE: *(bool*)data = true; return true;
+                  case RETRO_ENVIRONMENT_SET_PIXEL_FORMAT: return true;
+                  case RETRO_ENVIRONMENT_GET_SYSTEM_DIRECTORY: *(const char**)data = g_systemDir.c_str(); return true;
+                  case RETRO_ENVIRONMENT_GET_SAVE_DIRECTORY: *(const char**)data = g_saveDir.c_str(); return true;
+                  case RETRO_ENVIRONMENT_GET_LOG_INTERFACE: ((retro_log_callback*)data)->log = logCb; return true;
+                  case RETRO_ENVIRONMENT_GET_VARIABLE: {
+                      auto* v = (retro_variable*)data;
+                      std::lock_guard<std::mutex> l(g_optMutex);
+                      auto it = g_options.find(v->key);
+                      if (it == g_options.end()) return false;
+                      v->value = it->second.c_str();
+                      return true;
+                  }
+                  case RETRO_ENVIRONMENT_GET_VARIABLE_UPDATE:
+                      *(bool*)data = g_optionsDirty.exchange(false);
+                      return true;
+                  case RETRO_ENVIRONMENT_SET_VARIABLES: return true;
+                  case RETRO_ENVIRONMENT_SET_SERIALIZATION_QUIRKS: return true;
+                  case RETRO_ENVIRONMENT_SET_GEOMETRY:
+                      updateAspect(*(retro_game_geometry*)data);
+                      return true;
+                  case RETRO_ENVIRONMENT_SET_SYSTEM_AV_INFO: {
+                      auto* av = (retro_system_av_info*)data;
+                      updateAspect(av->geometry);
+                      if (av->timing.sample_rate > 0) g_sampleRate = (int)av->timing.sample_rate;
+                      resizeFbo(av->geometry.max_width, av->geometry.max_height);
+                      return true;
+                  }
+                  case RETRO_ENVIRONMENT_SET_HW_RENDER: {
+                      auto* hw = (retro_hw_render_callback*)data;
+                      hw->get_current_framebuffer = getCurrentFb;
+                      hw->get_proc_address = getProc;
+                      g_hw = *hw;
+                      LOGI("HW render pedido: tipo=%u v%u.%u", (unsigned)hw->context_type, hw->version_major, hw->version_minor);
+                      return true;
+                  }
+                  default:
+                      if (seen.insert(cmd).second) LOGI("env cmd %u nao tratado", cmd);
+                      return false;
+              }
+          }
+
+          void present() {
+              EGLint sw = 0, sh = 0;
+              eglQuerySurface(g_dpy, g_surf, EGL_WIDTH, &sw);
+              eglQuerySurface(g_dpy, g_surf, EGL_HEIGHT, &sh);
+              GLboolean scissor = glIsEnabled(GL_SCISSOR_TEST);
+              glDisable(GL_SCISSOR_TEST);
+              glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+              glViewport(0, 0, sw, sh);
+              glClearColor(0, 0, 0, 1);
+              glClear(GL_COLOR_BUFFER_BIT);
+              int dw = sw, dh = (int)(sw / g_aspect);
+              if (dh > sh) { dh = sh; dw = (int)(sh * g_aspect); }
+              int dx = (sw - dw) / 2, dy = (sh - dh) / 2;
+              unsigned fw = g_frameW < g_fboW ? g_frameW : g_fboW;
+              unsigned fh = g_frameH < g_fboH ? g_frameH : g_fboH;
+              glBindFramebuffer(GL_READ_FRAMEBUFFER, g_fbo);
+              glBlitFramebuffer(0, 0, fw, fh, dx, dy, dx + dw, dy + dh, GL_COLOR_BUFFER_BIT, GL_LINEAR);
+              glBindFramebuffer(GL_FRAMEBUFFER, g_fbo);
+              if (scissor) glEnable(GL_SCISSOR_TEST);
+              eglSwapBuffers(g_dpy, g_surf);
+          }
+
+          void videoCb(const void* data, unsigned w, unsigned h, size_t) {
+              if (!data || !g_fbo) return;
+              if (g_firstFrame) { g_firstFrame = false; LOGI("primeiro frame %ux%u", w, h); }
+              g_frameW = w; g_frameH = h;
+              present();
+          }
+
+          void audioOpen(int rate) {
+              AAudioStreamBuilder* b = nullptr;
+              if (AAudio_createStreamBuilder(&b) != AAUDIO_OK) return;
+              AAudioStreamBuilder_setDirection(b, AAUDIO_DIRECTION_OUTPUT);
+              AAudioStreamBuilder_setFormat(b, AAUDIO_FORMAT_PCM_I16);
+              AAudioStreamBuilder_setChannelCount(b, 2);
+              AAudioStreamBuilder_setSampleRate(b, rate);
+              AAudioStreamBuilder_setPerformanceMode(b, AAUDIO_PERFORMANCE_MODE_LOW_LATENCY);
+              if (AAudioStreamBuilder_openStream(b, &g_audio) == AAUDIO_OK) AAudioStream_requestStart(g_audio);
+              else { g_audio = nullptr; LOGE("AAudio nao abriu"); }
+              AAudioStreamBuilder_delete(b);
+          }
+          void audioClose() {
+              if (g_audio) { AAudioStream_requestStop(g_audio); AAudioStream_close(g_audio); g_audio = nullptr; }
+          }
+          size_t audioBatchCb(const int16_t* d, size_t frames) {
+              bool ok = false;
+              if (g_audio) {
+                  aaudio_result_t r = AAudioStream_write(g_audio, d, (int32_t)frames, 50LL * 1000000LL);
+                  ok = r >= 0;
+              }
+              if (!ok && g_sampleRate > 0) usleep((useconds_t)((long long)frames * 1000000LL / g_sampleRate));
+              return frames;
+          }
+          void audioSampleCb(int16_t l, int16_t r) { int16_t s[2] = {l, r}; audioBatchCb(s, 1); }
+
+          void pollCb() {}
+          int16_t stateCb(unsigned port, unsigned device, unsigned index, unsigned id) {
+              if (port != 0) return 0;
+              if (device == RETRO_DEVICE_JOYPAD) {
+                  int b = g_buttons.load();
+                  if (id == RETRO_DEVICE_ID_JOYPAD_MASK) return (int16_t)b;
+                  if (id > 15) return 0;
+                  return (int16_t)((b >> id) & 1);
+              }
+              if (device == RETRO_DEVICE_ANALOG) {
+                  int base = (index == RETRO_DEVICE_INDEX_ANALOG_RIGHT) ? 2 : 0;
+                  if (index != RETRO_DEVICE_INDEX_ANALOG_LEFT && index != RETRO_DEVICE_INDEX_ANALOG_RIGHT) return 0;
+                  if (id == RETRO_DEVICE_ID_ANALOG_X) return (int16_t)g_axes[base].load();
+                  if (id == RETRO_DEVICE_ID_ANALOG_Y) return (int16_t)g_axes[base + 1].load();
+              }
+              return 0;
+          }
+
+          // ---------- EGL ----------
+          bool eglInit() {
+              g_dpy = eglGetDisplay(EGL_DEFAULT_DISPLAY);
+              if (g_dpy == EGL_NO_DISPLAY || !eglInitialize(g_dpy, nullptr, nullptr)) { LOGE("eglInitialize falhou"); return false; }
+              const EGLint cfgAttr[] = {EGL_RENDERABLE_TYPE, 0x0040 /*ES3*/, EGL_SURFACE_TYPE, EGL_WINDOW_BIT,
+                                        EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8, EGL_ALPHA_SIZE, 8, EGL_NONE};
+              EGLConfig cfg; EGLint n = 0;
+              if (!eglChooseConfig(g_dpy, cfgAttr, &cfg, 1, &n) || n < 1) { LOGE("eglChooseConfig falhou"); return false; }
+              g_surf = eglCreateWindowSurface(g_dpy, cfg, g_window, nullptr);
+              if (g_surf == EGL_NO_SURFACE) { LOGE("eglCreateWindowSurface falhou"); return false; }
+              const int vers[3][2] = {{3, 2}, {3, 1}, {3, 0}};
+              for (int i = 0; i < 3 && g_ctx == EGL_NO_CONTEXT; i++) {
+                  const EGLint a[] = {0x3098 /*MAJOR*/, vers[i][0], 0x30FB /*MINOR*/, vers[i][1], EGL_NONE};
+                  g_ctx = eglCreateContext(g_dpy, cfg, EGL_NO_CONTEXT, a);
+                  if (g_ctx != EGL_NO_CONTEXT) LOGI("contexto OpenGL ES %d.%d criado", vers[i][0], vers[i][1]);
+              }
+              if (g_ctx == EGL_NO_CONTEXT) {
+                  const EGLint a[] = {EGL_CONTEXT_CLIENT_VERSION, 3, EGL_NONE};
+                  g_ctx = eglCreateContext(g_dpy, cfg, EGL_NO_CONTEXT, a);
+              }
+              if (g_ctx == EGL_NO_CONTEXT) { LOGE("eglCreateContext falhou"); return false; }
+              return eglMakeCurrent(g_dpy, g_surf, g_surf, g_ctx);
+          }
+          void eglShutdown() {
+              if (g_dpy != EGL_NO_DISPLAY) {
+                  eglMakeCurrent(g_dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+                  if (g_ctx != EGL_NO_CONTEXT) eglDestroyContext(g_dpy, g_ctx);
+                  if (g_surf != EGL_NO_SURFACE) eglDestroySurface(g_dpy, g_surf);
+                  eglTerminate(g_dpy);
+              }
+              g_dpy = EGL_NO_DISPLAY; g_surf = EGL_NO_SURFACE; g_ctx = EGL_NO_CONTEXT;
+          }
+
+          // ---------- saves (SRAM/EEPROM/Flash/Controller Pak) ----------
+          // O núcleo não grava .srm sozinho: quem grava é o frontend (como o RetroArch faz).
+          std::string savePath() {
+              if (g_saveName.empty()) return "";
+              return g_saveDir + "/" + g_saveName + ".srm";
+          }
+
+          void loadSram() {
+              if (!p_get_memory_data || !p_get_memory_size) { LOGE("nucleo sem retro_get_memory_*: saves desativados"); return; }
+              size_t sz = p_get_memory_size(RETRO_MEMORY_SAVE_RAM);
+              void* mem = p_get_memory_data(RETRO_MEMORY_SAVE_RAM);
+              std::string path = savePath();
+              LOGI("SRAM: tamanho=%zu arquivo=%s", sz, path.c_str());
+              if (!sz || !mem || path.empty()) return;
+              FILE* f = fopen(path.c_str(), "rb");
+              if (f) {
+                  size_t got = fread(mem, 1, sz, f);
+                  fclose(f);
+                  LOGI("SRAM carregada (%zu bytes)", got);
+              }
+              g_lastSram.assign((uint8_t*)mem, (uint8_t*)mem + sz);
+
+              // Saves importados de outros formatos (.eep/.mpk/.sra/.fla) entram por cima do estado inicial do núcleo.
+              // Layout do núcleo: EEPROM 0x800 | 4 Controller Paks 0x8000 | SRAM 0x8000 | FlashRAM 0x20000.
+              if (sz == 0x48800) {
+                  struct Part { const char* ext; size_t off; size_t len; };
+                  const Part parts[] = {{"eep", 0, 0x800}, {"mpk", 0x800, 0x8000}, {"sra", 0x20800, 0x8000}, {"fla", 0x28800, 0x20000}};
+                  for (const Part& pt : parts) {
+                      std::string op = g_saveDir + "/" + g_saveName + "." + pt.ext;
+                      FILE* of = fopen(op.c_str(), "rb");
+                      if (!of) continue;
+                      std::vector<uint8_t> tmp(pt.len);
+                      size_t got = fread(tmp.data(), 1, pt.len, of);
+                      fclose(of);
+                      if (got > 0) {
+                          memcpy((uint8_t*)mem + pt.off, tmp.data(), got);
+                          LOGI("save importado aplicado: .%s (%zu bytes)", pt.ext, got);
+                      }
+                      rename(op.c_str(), (op + ".importado").c_str());
+                  }
+              }
+          }
+
+          void flushSram() {
+              if (!p_get_memory_data || !p_get_memory_size) return;
+              size_t sz = p_get_memory_size(RETRO_MEMORY_SAVE_RAM);
+              void* mem = p_get_memory_data(RETRO_MEMORY_SAVE_RAM);
+              std::string path = savePath();
+              if (!sz || !mem || path.empty()) return;
+              if (g_lastSram.size() == sz && memcmp(g_lastSram.data(), mem, sz) == 0) return;  // nada mudou
+              std::string tmp = path + ".tmp";
+              FILE* f = fopen(tmp.c_str(), "wb");
+              if (!f) { LOGE("nao consegui gravar o save em %s", tmp.c_str()); return; }
+              size_t w = fwrite(mem, 1, sz, f);
+              fclose(f);
+              if (w != sz) { remove(tmp.c_str()); LOGE("gravacao do save incompleta"); return; }
+              if (rename(tmp.c_str(), path.c_str()) != 0) { LOGE("nao consegui renomear o save"); return; }
+              g_lastSram.assign((uint8_t*)mem, (uint8_t*)mem + sz);
+              LOGI("save gravado (%zu bytes)", sz);
+          }
+
+          // ---------- jogo ----------
+          void runGame(const std::string& romPath, bool& coreLoaded, bool& gameLoaded) {
+              g_firstFrame = true;
+              g_frameW = g_frameH = 0;
+              if (!eglInit()) { setStatus("ERRO: falha ao criar o contexto gráfico (OpenGL ES 3)."); return; }
+              eglSwapInterval(g_dpy, 0);
+              LOGI("GL_VERSION=%s", (const char*)glGetString(GL_VERSION));
+              LOGI("GL_RENDERER=%s", (const char*)glGetString(GL_RENDERER));
+
+              if (!loadCore()) { setStatus("ERRO: não consegui carregar o núcleo N64 (libmupen_core.so). Veja o log."); return; }
+              coreLoaded = true;
+
+              p_set_environment(envCb);
+              p_set_video_refresh(videoCb);
+              p_set_audio_sample(audioSampleCb);
+              p_set_audio_batch(audioBatchCb);
+              p_set_input_poll(pollCb);
+              p_set_input_state(stateCb);
+              p_init();
+
+              retro_system_info si{};
+              p_get_system_info(&si);
+              LOGI("nucleo: %s %s need_fullpath=%d", si.library_name ? si.library_name : "?",
+                   si.library_version ? si.library_version : "?", (int)si.need_fullpath);
+
+              retro_game_info gi{};
+              std::vector<uint8_t> buf;
+              gi.path = romPath.c_str();
+              if (!si.need_fullpath) {
+                  FILE* f = fopen(romPath.c_str(), "rb");
+                  if (!f) { setStatus("ERRO: não consegui ler a ROM."); return; }
+                  fseek(f, 0, SEEK_END);
+                  long sz = ftell(f);
+                  fseek(f, 0, SEEK_SET);
+                  buf.resize(sz > 0 ? (size_t)sz : 0);
+                  size_t got = fread(buf.data(), 1, buf.size(), f);
+                  fclose(f);
+                  if (got != buf.size()) { setStatus("ERRO: leitura incompleta da ROM."); return; }
+                  gi.data = buf.data();
+                  gi.size = buf.size();
+              }
+              LOGI("carregando ROM (%zu bytes)", buf.size());
+              if (!p_load_game(&gi)) { setStatus("ERRO: o núcleo recusou a ROM (formato inválido ou não suportado)."); return; }
+              gameLoaded = true;
+              loadSram();
+
+              retro_system_av_info av{};
+              p_get_av_info(&av);
+              updateAspect(av.geometry);
+              if (av.timing.sample_rate > 0) g_sampleRate = (int)av.timing.sample_rate;
+              LOGI("av: base %ux%u max %ux%u aspect=%.3f fps=%.2f rate=%.0f", av.geometry.base_width, av.geometry.base_height,
+                   av.geometry.max_width, av.geometry.max_height, g_aspect, av.timing.fps, av.timing.sample_rate);
+              unsigned mw = av.geometry.max_width > 640 ? av.geometry.max_width : 640;
+              unsigned mh = av.geometry.max_height > 480 ? av.geometry.max_height : 480;
+              createFbo(mw, mh);
+              audioOpen(g_sampleRate);
+              if (g_hw.context_reset) g_hw.context_reset();
+              else LOGE("o nucleo nao pediu HW render");
+              setStatus("OK");
+              LOGI("rodando");
+
+              unsigned frames = 0;
+              while (g_running) {
+                  if (g_paused) {
+                      flushSram();  // app em segundo plano pode ser encerrado pelo Android
+                      std::unique_lock<std::mutex> l(g_pauseMutex);
+                      g_pauseCv.wait(l, [] { return !g_paused || !g_running; });
+                      continue;
+                  }
+                  p_run();
+                  if (++frames % 600 == 0) flushSram();  // ~10 s
+              }
+              flushSram();
+          }
+
+          void emuThread(std::string romPath) {
+              bool coreLoaded = false, gameLoaded = false;
+              runGame(romPath, coreLoaded, gameLoaded);
+              if (gameLoaded) {
+                  if (g_hw.context_destroy) g_hw.context_destroy();
+                  p_unload_game();
+              }
+              if (coreLoaded) { p_deinit(); dlclose(g_lib); g_lib = nullptr; }
+              if (g_fbo) destroyFbo();
+              audioClose();
+              eglShutdown();
+              g_hw = retro_hw_render_callback{};
+              g_running = false;
+              LOGI("thread encerrada");
+          }
+
+          std::string jstr(JNIEnv* env, jstring s) {
+              const char* c = env->GetStringUTFChars(s, nullptr);
+              std::string r = c ? c : "";
+              if (c) env->ReleaseStringUTFChars(s, c);
+              return r;
+          }
+
+          }  // namespace
+
+          extern "C" {
+
+          JNIEXPORT void JNICALL Java_dev_n64emu_app_NativeBridge_init(JNIEnv* env, jobject, jstring libPath, jstring sysDir, jstring saveDir, jstring logPath) {
+              g_libPath = jstr(env, libPath);
+              g_systemDir = jstr(env, sysDir);
+              g_saveDir = jstr(env, saveDir);
+              std::string lp = jstr(env, logPath);
+              std::lock_guard<std::mutex> l(g_logMutex);
+              if (g_logf) { fclose(g_logf); g_logf = nullptr; }
+              if (!lp.empty()) g_logf = fopen(lp.c_str(), "w");
+          }
+          JNIEXPORT void JNICALL Java_dev_n64emu_app_NativeBridge_setSaveName(JNIEnv* env, jobject, jstring n) {
+              g_saveName = jstr(env, n);
+          }
+          JNIEXPORT void JNICALL Java_dev_n64emu_app_NativeBridge_setOption(JNIEnv* env, jobject, jstring k, jstring v) {
+              std::lock_guard<std::mutex> l(g_optMutex);
+              g_options[jstr(env, k)] = jstr(env, v);
+              g_optionsDirty = true;
+          }
+          JNIEXPORT jstring JNICALL Java_dev_n64emu_app_NativeBridge_getStatus(JNIEnv* env, jobject) {
+              std::lock_guard<std::mutex> l(g_statusMutex);
+              return env->NewStringUTF(g_status.c_str());
+          }
+          JNIEXPORT void JNICALL Java_dev_n64emu_app_NativeBridge_start(JNIEnv* env, jobject, jstring rom, jobject surface) {
+              if (g_thread.joinable()) {
+                  g_running = false; g_paused = false; g_pauseCv.notify_all();
+                  g_thread.join();
+                  if (g_window) { ANativeWindow_release(g_window); g_window = nullptr; }
+              }
+              setStatus("");
+              g_buttons = 0;
+              for (int i = 0; i < 4; i++) g_axes[i] = 0;
+              g_window = ANativeWindow_fromSurface(env, surface);
+              g_running = true;
+              g_paused = false;
+              g_thread = std::thread(emuThread, jstr(env, rom));
+          }
+          JNIEXPORT void JNICALL Java_dev_n64emu_app_NativeBridge_pause(JNIEnv*, jobject) { g_paused = true; }
+          JNIEXPORT void JNICALL Java_dev_n64emu_app_NativeBridge_resume(JNIEnv*, jobject) {
+              g_paused = false; g_pauseCv.notify_all();
+          }
+          JNIEXPORT void JNICALL Java_dev_n64emu_app_NativeBridge_stop(JNIEnv*, jobject) {
+              g_running = false; g_paused = false; g_pauseCv.notify_all();
+              if (g_thread.joinable()) g_thread.join();
+              if (g_window) { ANativeWindow_release(g_window); g_window = nullptr; }
+          }
+          JNIEXPORT void JNICALL Java_dev_n64emu_app_NativeBridge_setButton(JNIEnv*, jobject, jint id, jboolean pressed) {
+              if (id < 0 || id > 15) return;
+              int cur = g_buttons.load();
+              g_buttons = pressed ? (cur | (1 << id)) : (cur & ~(1 << id));
+          }
+          JNIEXPORT void JNICALL Java_dev_n64emu_app_NativeBridge_setAnalog(JNIEnv*, jobject, jint which, jfloat x, jfloat y) {
+              int base = which == 1 ? 2 : 0;
+              if (x > 1.f) x = 1.f; if (x < -1.f) x = -1.f;
+              if (y > 1.f) y = 1.f; if (y < -1.f) y = -1.f;
+              g_axes[base] = (int)(x * 32767.f);
+              g_axes[base + 1] = (int)(y * 32767.f);
+          }
+
+          }
+          N64EMU_EOF
+          cat > app/src/main/java/dev/n64emu/app/ControlsView.kt <<'N64EMU_EOF'
+          package dev.n64emu.app
+
+          import android.content.Context
+          import android.graphics.Canvas
+          import android.graphics.Color
+          import android.graphics.Paint
+          import android.view.MotionEvent
+          import android.view.View
+          import kotlin.math.abs
+          import kotlin.math.hypot
+
+          /**
+           * Controles na tela. IDs 0..15 = botões RetroPad; 100..103 = botões C.
+           * O analógico é flutuante: nasce onde o dedo toca (perto da posição dele), segue o dedo
+           * e só aquele dedo o controla. Isso evita os "pulos" do analógico.
+           *
+           * edit = true: modo de edição (arrastar para mover, escolher tamanho, ocultar). Não envia nada ao jogo.
+           * Itens editáveis: cada botão solto, o D-pad (grupo), os botões C (grupo) e o analógico.
+           */
+          class ControlsView(ctx: Context, private val edit: Boolean = false) : View(ctx) {
+              private class Item(val key: Int, val name: String, val dcx: Float, val dcy: Float, val dr: Float, val dsp: Float = 0f) {
+                  var cx = dcx
+                  var cy = dcy
+                  var scale = 1f
+                  var visible = true
+                  val r get() = dr * scale
+                  val sp get() = dsp * scale
+              }
+
+              private class Circ(val id: Int, val label: String, val x: Float, val y: Float, val r: Float, val dim: Boolean)
+
+              private companion object {
+                  const val K_STICK = 200
+                  const val K_DPAD = 300
+                  const val K_C = 301
+              }
+
+              private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
+              private var items = listOf<Item>()
+              private var circs = listOf<Circ>()
+              private val pressed = BooleanArray(16)
+              private var cX = 0f
+              private var cY = 0f
+
+              private var stick: Item? = null
+              private var stickPid = -1
+              private var ox = 0f
+              private var oy = 0f
+              private var kx = 0f
+              private var ky = 0f
+              private var outX = 0f
+              private var outY = 0f
+              private val dead = 0.12f
+
+              // edição
+              private var selected: Item? = null
+              private var dragDx = 0f
+              private var dragDy = 0f
+              private var ignoreSaved = false
+
+              /** Avisa o editor quando a seleção muda: nome, tamanho em %, visível, pode ocultar. */
+              var onSelection: ((String?, Int, Boolean, Boolean) -> Unit)? = null
+
+              private fun dp(v: Float) = v * resources.displayMetrics.density
+
+              override fun onSizeChanged(w: Int, h: Int, ow: Int, oh: Int) {
+                  val u = h.toFloat()
+                  val W = w.toFloat()
+                  val d = 0.095f * u
+                  val dr = 0.05f * u
+                  val list = ArrayList<Item>()
+                  list.add(Item(K_STICK, "Analógico", 0.17f * W, 0.76f * u, 0.17f * u))
+                  list.add(Item(K_DPAD, "D-pad", 0.11f * W, 0.31f * u, dr, d))
+                  list.add(Item(K_C, "Botões C", 0.80f * W, 0.30f * u, 0.05f * u, 0.10f * u))
+                  list.add(Item(0, "A", 0.91f * W, 0.68f * u, 0.085f * u))
+                  list.add(Item(1, "B", 0.80f * W, 0.78f * u, 0.075f * u))
+                  list.add(Item(3, "Start", 0.50f * W, 0.92f * u, 0.055f * u))
+                  list.add(Item(10, "L", 0.07f * W, 0.09f * u, 0.065f * u))
+                  list.add(Item(12, "Z", 0.16f * W, 0.09f * u, 0.065f * u))
+                  list.add(Item(11, "R", 0.93f * W, 0.09f * u, 0.065f * u))
+                  val saved = if (ignoreSaved) emptyMap<Int, ItemPrefs>() else ControlsLayout.load(context)
+                  for (it in list) {
+                      val p = saved[it.key] ?: continue
+                      it.cx = (p.x * W).coerceIn(0f, W)
+                      it.cy = (p.y * u).coerceIn(0f, u)
+                      it.scale = p.scale.coerceIn(0.5f, 2f)
+                      it.visible = p.visible || it.key == K_STICK
+                  }
+                  items = list
+                  stick = list.first { it.key == K_STICK }
+                  selected = null
+                  rebuild()
+              }
+
+              private fun label(id: Int) = when (id) {
+                  0 -> "A"; 1 -> "B"; 3 -> "ST"; 10 -> "L"; 11 -> "R"; 12 -> "Z"; else -> "?"
+              }
+
+              private fun rebuild() {
+                  val l = ArrayList<Circ>()
+                  for (it in items) {
+                      if (it.key == K_STICK) continue
+                      val dim = !it.visible
+                      if (dim && !edit) continue
+                      when (it.key) {
+                          K_DPAD -> {
+                              l.add(Circ(4, "▲", it.cx, it.cy - it.sp, it.r, dim)); l.add(Circ(5, "▼", it.cx, it.cy + it.sp, it.r, dim))
+                              l.add(Circ(6, "◀", it.cx - it.sp, it.cy, it.r, dim)); l.add(Circ(7, "▶", it.cx + it.sp, it.cy, it.r, dim))
+                          }
+                          K_C -> {
+                              l.add(Circ(100, "C▲", it.cx, it.cy - it.sp, it.r, dim)); l.add(Circ(101, "C▼", it.cx, it.cy + it.sp, it.r, dim))
+                              l.add(Circ(102, "C◀", it.cx - it.sp, it.cy, it.r, dim)); l.add(Circ(103, "C▶", it.cx + it.sp, it.cy, it.r, dim))
+                          }
+                          else -> l.add(Circ(it.key, label(it.key), it.cx, it.cy, it.r, dim))
+                      }
+                  }
+                  circs = l
+              }
+
+              override fun onDraw(c: Canvas) {
+                  val st = stick
+                  if (st != null) {
+                      val active = stickPid != -1
+                      val bx = if (active) ox else st.cx
+                      val by = if (active) oy else st.cy
+                      val sr = st.r
+                      paint.style = Paint.Style.FILL
+                      paint.color = Color.argb(if (active) 80 else 45, 255, 255, 255)
+                      c.drawCircle(bx, by, sr, paint)
+                      paint.color = Color.argb(if (active) 170 else 90, 255, 255, 255)
+                      c.drawCircle(bx + kx * sr, by + ky * sr, sr * 0.4f, paint)
+                      if (edit) {
+                          paint.color = Color.argb(220, 0, 0, 0)
+                          paint.textSize = sr * 0.25f
+                          paint.textAlign = Paint.Align.CENTER
+                          c.drawText("Analógico", bx, by + sr * 0.9f + 0f, paint)
+                      }
+                  }
+                  for (b in circs) {
+                      val on = !edit && (if (b.id < 16) pressed[b.id] else isCOn(b.id))
+                      val a = if (b.dim) 30 else if (on) 170 else 80
+                      paint.style = Paint.Style.FILL
+                      paint.color = Color.argb(a, 255, 255, 255)
+                      c.drawCircle(b.x, b.y, b.r, paint)
+                      paint.color = Color.argb(if (b.dim) 90 else 220, 0, 0, 0)
+                      if (b.dim) paint.color = Color.argb(160, 255, 255, 255)
+                      paint.textSize = b.r * 0.8f
+                      paint.textAlign = Paint.Align.CENTER
+                      c.drawText(b.label, b.x, b.y + b.r * 0.28f, paint)
+                  }
+                  val sel = selected
+                  if (edit && sel != null) {
+                      paint.style = Paint.Style.STROKE
+                      paint.strokeWidth = dp(3f)
+                      paint.color = Color.rgb(255, 214, 10)
+                      when (sel.key) {
+                          K_STICK -> c.drawCircle(sel.cx, sel.cy, sel.r + dp(4f), paint)
+                          K_DPAD, K_C -> {
+                              val e = sel.sp + sel.r + dp(6f)
+                              c.drawRoundRect(sel.cx - e, sel.cy - e, sel.cx + e, sel.cy + e, dp(12f), dp(12f), paint)
+                          }
+                          else -> c.drawCircle(sel.cx, sel.cy, sel.r + dp(5f), paint)
+                      }
+                      paint.style = Paint.Style.FILL
+                  }
+              }
+
+              private fun isCOn(id: Int) = when (id) {
+                  100 -> cY < -0.5f
+                  101 -> cY > 0.5f
+                  102 -> cX < -0.5f
+                  else -> cX > 0.5f
+              }
+
+              private fun overButton(x: Float, y: Float): Boolean {
+                  for (b in circs) if (hypot(x - b.x, y - b.y) < b.r * 1.25f) return true
+                  return false
+              }
+
+              // ---------- edição ----------
+
+              private fun hit(it: Item, x: Float, y: Float): Boolean = when (it.key) {
+                  K_STICK -> hypot(x - it.cx, y - it.cy) < it.r
+                  K_DPAD, K_C -> {
+                      val e = it.sp + it.r * 1.2f
+                      abs(x - it.cx) < e && abs(y - it.cy) < e
+                  }
+                  else -> hypot(x - it.cx, y - it.cy) < maxOf(it.r * 1.3f, dp(24f))
+              }
+
+              private fun notifySelection() {
+                  val s = selected
+                  if (s == null) onSelection?.invoke(null, 100, true, false)
+                  else onSelection?.invoke(s.name, Math.round(s.scale * 100f), s.visible, s.key != K_STICK)
+              }
+
+              private fun editTouch(e: MotionEvent): Boolean {
+                  val x = e.x
+                  val y = e.y
+                  when (e.actionMasked) {
+                      MotionEvent.ACTION_DOWN -> {
+                          // o último da lista fica "por cima"; escolhe o mais próximo entre os que o dedo alcança
+                          var best: Item? = null
+                          var bestD = Float.MAX_VALUE
+                          for (it in items) {
+                              if (hit(it, x, y)) {
+                                  val d = hypot(x - it.cx, y - it.cy)
+                                  if (d < bestD) { best = it; bestD = d }
+                              }
+                          }
+                          selected = best
+                          if (best != null) { dragDx = best.cx - x; dragDy = best.cy - y }
+                          notifySelection()
+                      }
+                      MotionEvent.ACTION_MOVE -> {
+                          val s = selected
+                          if (s != null) {
+                              val m = if (s.key == K_DPAD || s.key == K_C) s.sp + s.r else s.r
+                              s.cx = (x + dragDx).coerceIn(m, maxOf(m, width - m))
+                              s.cy = (y + dragDy).coerceIn(m, maxOf(m, height - m))
+                              rebuild()
+                          }
+                      }
+                  }
+                  invalidate()
+                  return true
+              }
+
+              /** Tamanho do item selecionado, em % (50..200). */
+              fun setScalePercent(p: Int) {
+                  val s = selected ?: return
+                  s.scale = (p / 100f).coerceIn(0.5f, 2f)
+                  rebuild()
+                  invalidate()
+              }
+
+              fun toggleVisible() {
+                  val s = selected ?: return
+                  if (s.key == K_STICK) return
+                  s.visible = !s.visible
+                  rebuild()
+                  notifySelection()
+                  invalidate()
+              }
+
+              /** Volta tudo ao padrão na tela do editor; só vale de verdade depois de Salvar. */
+              fun resetLayout() {
+                  ignoreSaved = true
+                  onSizeChanged(width, height, width, height)
+                  ignoreSaved = false
+                  notifySelection()
+                  invalidate()
+              }
+
+              fun saveLayout() {
+                  val w = width.toFloat()
+                  val h = height.toFloat()
+                  if (w <= 0f || h <= 0f) return
+                  val m = HashMap<Int, ItemPrefs>()
+                  for (it in items) m[it.key] = ItemPrefs(it.cx / w, it.cy / h, it.scale, it.visible)
+                  ControlsLayout.save(context, m)
+              }
+
+              // ---------- jogo ----------
+
+              override fun onTouchEvent(e: MotionEvent): Boolean {
+                  if (edit) return editTouch(e)
+                  val st = stick
+                  val act = e.actionMasked
+                  val ai = e.actionIndex
+                  val stickR = st?.r ?: 1f
+                  when (act) {
+                      MotionEvent.ACTION_DOWN, MotionEvent.ACTION_POINTER_DOWN -> {
+                          val x = e.getX(ai)
+                          val y = e.getY(ai)
+                          if (st != null && stickPid == -1 && abs(x - st.cx) < 0.28f * width && y > st.cy - 0.26f * height && !overButton(x, y)) {
+                              stickPid = e.getPointerId(ai)
+                              ox = x
+                              oy = y
+                          }
+                      }
+                      MotionEvent.ACTION_UP, MotionEvent.ACTION_POINTER_UP -> {
+                          if (e.getPointerId(ai) == stickPid) stickPid = -1
+                      }
+                      MotionEvent.ACTION_CANCEL -> stickPid = -1
+                  }
+                  val lifting = act == MotionEvent.ACTION_UP || act == MotionEvent.ACTION_POINTER_UP
+                  val cancel = act == MotionEvent.ACTION_CANCEL
+
+                  // analógico
+                  var sx = 0f
+                  var sy = 0f
+                  kx = 0f
+                  ky = 0f
+                  if (stickPid != -1) {
+                      val idx = e.findPointerIndex(stickPid)
+                      if (idx >= 0) {
+                          val px = e.getX(idx)
+                          val py = e.getY(idx)
+                          var dx = px - ox
+                          var dy = py - oy
+                          val d = hypot(dx, dy)
+                          if (d > stickR) {
+                              val k = (d - stickR) / d
+                              ox += dx * k
+                              oy += dy * k
+                              dx = px - ox
+                              dy = py - oy
+                          }
+                          var nx = dx / stickR
+                          var ny = dy / stickR
+                          kx = nx
+                          ky = ny
+                          val mag = hypot(nx, ny)
+                          if (mag < dead) {
+                              nx = 0f
+                              ny = 0f
+                          } else {
+                              val s = ((mag - dead) / (1f - dead)).coerceAtMost(1f) / mag
+                              nx *= s
+                              ny *= s
+                          }
+                          sx = nx
+                          sy = ny
+                      } else {
+                          stickPid = -1
+                      }
+                  }
+
+                  // botões
+                  val np = BooleanArray(16)
+                  var ncx = 0f
+                  var ncy = 0f
+                  if (!cancel) {
+                      for (i in 0 until e.pointerCount) {
+                          if (lifting && i == ai) continue
+                          if (e.getPointerId(i) == stickPid) continue
+                          val x = e.getX(i)
+                          val y = e.getY(i)
+                          for (b in circs) {
+                              if (hypot(x - b.x, y - b.y) < b.r * 1.25f) {
+                                  when (b.id) {
+                                      100 -> ncy = -1f
+                                      101 -> ncy = 1f
+                                      102 -> ncx = -1f
+                                      103 -> ncx = 1f
+                                      else -> np[b.id] = true
+                                  }
+                              }
+                          }
+                      }
+                  }
+                  for (i in 0..15) {
+                      if (np[i] != pressed[i]) {
+                          pressed[i] = np[i]
+                          NativeBridge.setButton(i, np[i])
+                      }
+                  }
+                  if (sx != outX || sy != outY) {
+                      outX = sx
+                      outY = sy
+                      NativeBridge.setAnalog(0, sx, sy)
+                  }
+                  if (ncx != cX || ncy != cY) {
+                      cX = ncx
+                      cY = ncy
+                      NativeBridge.setAnalog(1, cX, cY)
+                  }
+                  invalidate()
+                  return true
+              }
+          }
+          N64EMU_EOF
+          cat > app/src/main/java/dev/n64emu/app/Covers.kt <<'N64EMU_EOF'
+          package dev.n64emu.app
+
+          import android.content.Context
+          import android.graphics.Bitmap
+          import android.graphics.BitmapFactory
+          import android.net.Uri
+          import android.os.Handler
+          import android.os.Looper
+          import java.io.File
+          import java.net.HttpURLConnection
+          import java.net.URL
+          import java.net.URLEncoder
+          import java.util.concurrent.Executors
+
+          /** Lista de jogos conhecidos (No-Intro, via libretro-database): CRC32 -> nome oficial. */
+          class GameDb(val byCrc: Map<String, String>, private val byCode: Map<String, List<String>>, private val names: List<String>) {
+              private fun norm(s: String): String =
+                  s.lowercase().replace(Regex("\\(.*?\\)|\\[.*?\\]"), " ").replace(Regex("[^a-z0-9]+"), " ").trim()
+
+              private fun best(list: List<String>): String? =
+                  list.firstOrNull { it.contains("(USA)") } ?: list.firstOrNull { it.contains("(Europe)") } ?: list.firstOrNull()
+
+              /** Procura pelo código de 4 letras do cartucho (serve para ROM hacks do mesmo jogo). */
+              fun byGameCode(code: String): String? = if (code.length < 4) null else byCode[code]?.let { best(it) }
+
+              /** Procura pelo nome do arquivo, ignorando etiquetas como (USA) e [!]. */
+              fun byName(title: String): String? {
+                  val n = norm(title)
+                  if (n.isEmpty()) return null
+                  return best(names.filter { norm(it) == n })
+              }
+          }
+
+          object Covers {
+              private const val THUMBS = "https://thumbnails.libretro.com/Nintendo%20-%20Nintendo%2064"
+              private val DAT_URLS = listOf(
+                  "https://raw.githubusercontent.com/libretro/libretro-database/master/metadat/no-intro/Nintendo%20-%20Nintendo%2064.dat",
+                  "https://raw.githubusercontent.com/libretro/libretro-database/master/dat/Nintendo%20-%20Nintendo%2064.dat"
+              )
+              private val worker = Executors.newSingleThreadExecutor()
+              private val main = Handler(Looper.getMainLooper())
+              private val lock = Any()
+              private var db: GameDb? = null
+              private var downloadFailed = false
+
+              fun dir(ctx: Context): File = File(ctx.filesDir, "covers").apply { mkdirs() }
+
+              // ---------- lista de jogos ----------
+
+              private fun parseDat(text: String): GameDb {
+                  val byCrc = HashMap<String, String>()
+                  val byCode = HashMap<String, MutableList<String>>()
+                  val names = ArrayList<String>()
+                  val crcRe = Regex("crc ([0-9A-Fa-f]{8})")
+                  val serialRe = Regex("serial \"([^\"]+)\"")
+                  var inGame = false
+                  var cur: String? = null
+                  for (raw in text.lineSequence()) {
+                      val l = raw.trim()
+                      if (l.startsWith("game (")) { inGame = true; cur = null; continue }
+                      if (!inGame) continue
+                      if (l == ")") { inGame = false; cur = null; continue }
+                      if (cur == null && l.startsWith("name \"")) {
+                          val end = l.lastIndexOf('"')
+                          if (end > 6) { val nm = l.substring(6, end); cur = nm; names.add(nm) }
+                          continue
+                      }
+                      if (cur != null && l.startsWith("rom (")) {
+                          crcRe.find(l)?.let { byCrc[it.groupValues[1].uppercase()] = cur!! }
+                          serialRe.find(l)?.let {
+                              val parts = it.groupValues[1].split('-')
+                              val code = if (parts.size >= 2) parts[1] else parts[0]
+                              if (code.length == 4) byCode.getOrPut(code) { ArrayList() }.add(cur!!)
+                          }
+                      }
+                  }
+                  return GameDb(byCrc, byCode, names)
+              }
+
+              private fun download(url: String, out: File): Boolean {
+                  try {
+                      val c = URL(url).openConnection() as HttpURLConnection
+                      c.connectTimeout = 10000
+                      c.readTimeout = 20000
+                      if (c.responseCode != 200) return false
+                      val tmp = File(out.parentFile, out.name + ".tmp")
+                      c.inputStream.use { i -> tmp.outputStream().use { o -> i.copyTo(o) } }
+                      if (tmp.length() == 0L) { tmp.delete(); return false }
+                      out.delete()
+                      return tmp.renameTo(out)
+                  } catch (e: Exception) {
+                      return false
+                  }
+              }
+
+              /** Baixa a lista uma vez (e renova a cada 30 dias). Sem internet usa a cópia guardada. */
+              private fun loadDb(ctx: Context): GameDb? {
+                  synchronized(lock) {
+                      db?.let { return it }
+                      val f = File(ctx.filesDir, "n64_games.dat")
+                      val old = !f.exists() || System.currentTimeMillis() - f.lastModified() > 30L * 24 * 3600 * 1000
+                      if (old && !downloadFailed) {
+                          var ok = false
+                          for (u in DAT_URLS) { if (download(u, f)) { ok = true; break } }
+                          if (!ok) downloadFailed = true  // sem internet: não tenta de novo nesta sessão
+                      }
+                      if (!f.exists()) return null
+                      return try {
+                          val d = parseDat(f.readText(Charsets.UTF_8))
+                          if (d.byCrc.isEmpty()) null else { db = d; d }
+                      } catch (e: Exception) {
+                          null
+                      }
+                  }
+              }
+
+              // ---------- capas ----------
+
+              private fun thumbName(name: String): String =
+                  URLEncoder.encode(name.replace(Regex("[&*/:`<>?\\\\|\"]"), "_"), "UTF-8").replace("+", "%20")
+
+              private fun fetchImage(ctx: Context, id: String, name: String): String? {
+                  val enc = thumbName(name)
+                  for (kind in listOf("Named_Boxarts", "Named_Titles", "Named_Snaps")) {
+                      val out = File(dir(ctx), "$id.png")
+                      if (download("$THUMBS/$kind/$enc.png", out)) return out.absolutePath
+                  }
+                  return null
+              }
+
+              /**
+               * Reconhece o jogo (CRC32 da ROM) e busca a capa. Retorna true se algo mudou.
+               * force = true troca a capa mesmo que o jogo já tenha uma.
+               */
+              fun auto(ctx: Context, g: Game, force: Boolean = false): Boolean {
+                  var changed = false
+                  val uri = Uri.parse(g.uri)
+                  if (g.crc == null) { g.crc = Rom.crc32(ctx, uri); changed = g.crc != null }
+                  val hasCover = g.cover != null && File(g.cover!!).exists()
+                  if (hasCover && !force && g.recognized) return changed
+
+                  val d = loadDb(ctx)
+                  var official: String? = null
+                  if (d != null) {
+                      val byCrc = g.crc?.let { d.byCrc[it] }
+                      if (byCrc != null) {
+                          official = byCrc
+                          if (!g.recognized || g.title != byCrc) { g.title = byCrc; g.recognized = true; changed = true }
+                      } else {
+                          // ROM modificada ou fora da lista: tenta pelo código do cartucho e depois pelo nome do arquivo
+                          official = d.byGameCode(Rom.gameCode(ctx, uri)) ?: d.byName(g.title)
+                      }
+                  }
+                  if (!hasCover || force) {
+                      var p: String? = null
+                      if (official != null) p = fetchImage(ctx, g.id, official)
+                      if (p == null && official != g.title) p = fetchImage(ctx, g.id, g.title)
+                      if (p != null) { g.cover = p; changed = true }
+                  }
+                  return changed
+              }
+
+              /** Roda um jogo por vez em segundo plano; chama onChange (na tela principal) a cada mudança. */
+              fun autoAsync(ctx: Context, lib: Library, games: List<Game>, force: Boolean = false, onDone: ((Boolean) -> Unit)? = null, onChange: () -> Unit) {
+                  val app = ctx.applicationContext
+                  for (g in games) {
+                      worker.execute {
+                          var changed = false
+                          try {
+                              changed = auto(app, g, force)
+                              if (changed) {
+                                  lib.save()
+                                  main.post(onChange)
+                              }
+                          } catch (e: Throwable) {
+                          }
+                          if (onDone != null) main.post { onDone(changed) }
+                      }
+                  }
+              }
+
+              fun saveFromUri(ctx: Context, uri: Uri, id: String): String? {
+                  try {
+                      val bounds = BitmapFactory.Options()
+                      bounds.inJustDecodeBounds = true
+                      ctx.contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, bounds) }
+                      var s = 1
+                      while (bounds.outWidth / s > 600) s *= 2
+                      val opts = BitmapFactory.Options()
+                      opts.inSampleSize = s
+                      val bmp = ctx.contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, opts) } ?: return null
+                      val f = File(dir(ctx), "$id.jpg")
+                      f.outputStream().use { bmp.compress(Bitmap.CompressFormat.JPEG, 90, it) }
+                      return f.absolutePath
+                  } catch (e: Exception) {
+                      return null
+                  }
+              }
+
+              fun load(path: String, maxW: Int): Bitmap? {
+                  try {
+                      val bounds = BitmapFactory.Options()
+                      bounds.inJustDecodeBounds = true
+                      BitmapFactory.decodeFile(path, bounds)
+                      var s = 1
+                      while (bounds.outWidth / (s * 2) >= maxW) s *= 2
+                      val opts = BitmapFactory.Options()
+                      opts.inSampleSize = s
+                      return BitmapFactory.decodeFile(path, opts)
+                  } catch (e: Exception) {
+                      return null
+                  }
+              }
+          }
+          N64EMU_EOF
+          cat > app/src/main/java/dev/n64emu/app/EmulatorActivity.kt <<'N64EMU_EOF'
+          package dev.n64emu.app
+
+          import android.os.Bundle
+          import android.os.Handler
+          import android.os.Looper
+          import android.view.SurfaceHolder
+          import android.view.SurfaceView
+          import android.view.View
+          import android.widget.FrameLayout
+          import androidx.appcompat.app.AlertDialog
+          import androidx.appcompat.app.AppCompatActivity
+          import androidx.core.view.WindowCompat
+          import androidx.core.view.WindowInsetsCompat
+          import androidx.core.view.WindowInsetsControllerCompat
+          import java.io.File
+          import java.io.FileOutputStream
+
+          class EmulatorActivity : AppCompatActivity(), SurfaceHolder.Callback {
+              private var started = false
+              private var errorShown = false
+              private var ticks = 0
+              private val handler = Handler(Looper.getMainLooper())
+
+              private val poll = object : Runnable {
+                  override fun run() {
+                      val st = NativeBridge.getStatus()
+                      if (st.startsWith("ERRO")) {
+                          showError(st)
+                          return
+                      }
+                      ticks++
+                      if (ticks < 60) handler.postDelayed(this, 500)
+                  }
+              }
+
+              private fun showError(msg: String) {
+                  if (errorShown || isFinishing) return
+                  errorShown = true
+                  AlertDialog.Builder(this)
+                      .setTitle("Não consegui abrir o jogo")
+                      .setMessage(msg + "\n\nAbra Config > Diagnóstico para ver o log e copiar.")
+                      .setCancelable(false)
+                      .setPositiveButton("Fechar") { _, _ -> finish() }
+                      .show()
+              }
+
+              private fun setRunning(v: Boolean) {
+                  getSharedPreferences("n64emu", MODE_PRIVATE).edit().putBoolean("game_running", v).apply()
+              }
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  val s = Settings(this)
+                  val root = FrameLayout(this)
+                  val sv = SurfaceView(this)
+                  sv.holder.addCallback(this)
+                  root.addView(sv)
+                  val controls = ControlsView(this)
+                  controls.alpha = s.controlsAlpha / 100f
+                  controls.visibility = if (s.showControls) View.VISIBLE else View.GONE
+                  root.addView(controls)
+                  setContentView(root)
+
+                  WindowCompat.setDecorFitsSystemWindows(window, false)
+                  val ctl = WindowInsetsControllerCompat(window, root)
+                  ctl.hide(WindowInsetsCompat.Type.systemBars())
+                  ctl.systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+              }
+
+              override fun surfaceCreated(h: SurfaceHolder) {
+                  if (started) return
+                  started = true
+                  val uri = intent.data
+                  if (uri == null) {
+                      showError("ERRO: nenhuma ROM foi informada.")
+                      return
+                  }
+                  val surface = h.surface
+                  Thread {
+                      try {
+                          val s = Settings(this)
+                          val rom = File(cacheDir, "rom.z64")
+                          val ins = contentResolver.openInputStream(uri)
+                          if (ins == null) {
+                              runOnUiThread { showError("ERRO: não consegui abrir o arquivo da ROM (permissão perdida?). Remova e adicione a ROM de novo.") }
+                              return@Thread
+                          }
+                          ins.use { i -> FileOutputStream(rom).use { o -> i.copyTo(o) } }
+
+                          val sys = Storage.systemDir(this)
+                          Storage.hiresDir(this)
+                          File(sys, "hires_texture").mkdirs()
+                          val saves = Storage.savesDir(this)
+
+                          NativeBridge.init(
+                              applicationInfo.nativeLibraryDir + "/libmupen_core.so",
+                              sys.absolutePath,
+                              saves.absolutePath,
+                              Storage.logFile(this).absolutePath
+                          )
+                          NativeBridge.setSaveName(intent.getStringExtra("saveKey") ?: "jogo")
+                          NativeBridge.setOption("mupen64plus-aspect", s.aspect)
+                          NativeBridge.setOption("mupen64plus-EnableNativeResFactor", s.resolutionFactor.toString())
+                          NativeBridge.setOption("mupen64plus-txHiresEnable", if (s.texturePacks) "True" else "False")
+                          setRunning(true)
+                          NativeBridge.start(rom.absolutePath, surface)
+                          handler.post(poll)
+                      } catch (e: Throwable) {
+                          runOnUiThread { showError("ERRO: " + e.javaClass.simpleName + " - " + (e.message ?: "")) }
+                      }
+                  }.start()
+              }
+
+              override fun surfaceChanged(h: SurfaceHolder, f: Int, w: Int, hh: Int) {}
+
+              override fun surfaceDestroyed(h: SurfaceHolder) {
+                  handler.removeCallbacks(poll)
+                  try {
+                      NativeBridge.stop()
+                  } catch (e: Throwable) {
+                  }
+                  setRunning(false)
+                  started = false
+              }
+
+              override fun onPause() {
+                  super.onPause()
+                  try { NativeBridge.pause() } catch (e: Throwable) {}
+              }
+
+              override fun onResume() {
+                  super.onResume()
+                  try { NativeBridge.resume() } catch (e: Throwable) {}
+              }
+          }
+          N64EMU_EOF
+          cat > app/src/main/java/dev/n64emu/app/GamesTab.kt <<'N64EMU_EOF'
+          package dev.n64emu.app
+
+          import android.graphics.Color
+          import android.text.TextUtils
+          import android.view.Gravity
+          import android.view.View
+          import android.view.ViewOutlineProvider
+          import android.widget.FrameLayout
+          import android.widget.GridLayout
+          import android.widget.ImageView
+          import android.widget.LinearLayout
+          import android.widget.ScrollView
+          import android.widget.TextView
+          import android.widget.Toast
+          import androidx.appcompat.app.AlertDialog
+
+          class GamesTab(private val act: MainActivity) {
+              val view = FrameLayout(act)
+              private val grid = GridLayout(act)
+              private val empty: TextView
+
+              private fun dp(v: Int) = Ui.dp(act, v)
+
+              init {
+                  val col = LinearLayout(act)
+                  col.orientation = LinearLayout.VERTICAL
+                  col.setPadding(dp(12), dp(12), dp(12), dp(96))
+                  col.addView(Ui.text(act, "Jogos", 26f, bold = true))
+                  empty = Ui.text(act, "Nenhum jogo ainda.\nToque em \"＋ Adicionar ROM\" para começar.", 15f, Ui.SUB)
+                  empty.setPadding(0, dp(24), 0, dp(24))
+                  col.addView(empty)
+                  col.addView(grid)
+                  val scroll = ScrollView(act)
+                  scroll.addView(col)
+                  view.addView(scroll, FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
+
+                  val fab = Ui.button(act, "＋ Adicionar ROM") { act.addRoms.launch(arrayOf("*/*")) }
+                  val lp = FrameLayout.LayoutParams(FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM or Gravity.END)
+                  lp.setMargins(dp(16), dp(16), dp(16), dp(16))
+                  view.addView(fab, lp)
+              }
+
+              fun refresh() {
+                  grid.removeAllViews()
+                  val games = act.library.games
+                  empty.visibility = if (games.isEmpty()) View.VISIBLE else View.GONE
+                  val screenW = act.resources.displayMetrics.widthPixels
+                  val cols = maxOf(2, screenW / dp(160))
+                  grid.columnCount = cols
+                  val w = (screenW - 2 * dp(12)) / cols - 2 * dp(6)
+                  for (g in games) {
+                      val lp = GridLayout.LayoutParams()
+                      lp.width = w
+                      lp.height = GridLayout.LayoutParams.WRAP_CONTENT
+                      lp.setMargins(dp(6), dp(6), dp(6), dp(6))
+                      grid.addView(card(g, w), lp)
+                  }
+              }
+
+              private fun card(g: Game, w: Int): View {
+                  val box = LinearLayout(act)
+                  box.orientation = LinearLayout.VERTICAL
+                  box.background = Ui.rounded(Ui.CARD, dp(12))
+                  box.clipToOutline = true
+                  box.outlineProvider = ViewOutlineProvider.BACKGROUND
+
+                  val frame = FrameLayout(act)
+                  val img = ImageView(act)
+                  img.scaleType = ImageView.ScaleType.CENTER_CROP
+                  val bmp = g.cover?.let { Covers.load(it, w) }
+                  if (bmp != null) {
+                      img.setImageBitmap(bmp)
+                      frame.addView(img, FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
+                  } else {
+                      val hue = Math.floorMod(g.title.hashCode(), 360).toFloat()
+                      frame.setBackgroundColor(Color.HSVToColor(floatArrayOf(hue, 0.5f, 0.45f)))
+                      val letter = Ui.text(act, g.title.take(1).uppercase(), 40f, Ui.TEXT, true)
+                      letter.gravity = Gravity.CENTER
+                      frame.addView(letter, FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
+                  }
+                  box.addView(frame, LinearLayout.LayoutParams(w, (w * 0.8f).toInt()))
+
+                  val name = Ui.text(act, g.title, 13f)
+                  name.maxLines = 2
+                  name.ellipsize = TextUtils.TruncateAt.END
+                  name.setPadding(dp(8), dp(8), dp(8), dp(8))
+                  box.addView(name)
+
+                  box.setOnClickListener { act.launchGame(g) }
+                  box.setOnLongClickListener { options(g); true }
+                  return box
+              }
+
+              private fun options(g: Game) {
+                  val items = arrayOf("Escolher capa da galeria", "Reconhecer jogo e buscar capa", "Remover da lista")
+                  AlertDialog.Builder(act)
+                      .setTitle(g.title)
+                      .setItems(items) { _, which ->
+                          when (which) {
+                              0 -> {
+                                  act.coverTarget = g.id
+                                  act.pickCover.launch("image/*")
+                              }
+                              1 -> {
+                                  Toast.makeText(act, "Reconhecendo o jogo...", Toast.LENGTH_SHORT).show()
+                                  Covers.autoAsync(act, act.library, listOf(g), force = true, onDone = { ok ->
+                                      if (!ok) Toast.makeText(act, "Não achei a capa desse jogo. Use a galeria.", Toast.LENGTH_LONG).show()
+                                  }) { refresh() }
+                              }
+                              else -> {
+                                  act.library.remove(g.id)
+                                  refresh()
+                              }
+                          }
+                      }
+                      .show()
+              }
+          }
+          N64EMU_EOF
+          cat > app/src/main/java/dev/n64emu/app/MainActivity.kt <<'N64EMU_EOF'
+          package dev.n64emu.app
+
+          import android.content.Intent
+          import android.net.Uri
+          import android.os.Bundle
+          import android.view.Gravity
+          import android.view.View
+          import android.widget.FrameLayout
+          import android.widget.LinearLayout
+          import android.widget.TextView
+          import android.widget.Toast
+          import androidx.activity.result.contract.ActivityResultContracts
+          import androidx.appcompat.app.AppCompatActivity
+          import java.util.UUID
+
+          class MainActivity : AppCompatActivity() {
+              lateinit var settings: Settings
+              lateinit var library: Library
+              private lateinit var holder: FrameLayout
+              private lateinit var games: GamesTab
+              private lateinit var mods: ModsTab
+              lateinit var saves: SavesTab
+              private lateinit var config: SettingsTab
+              private lateinit var navItems: List<TextView>
+              var coverTarget: String? = null
+              var saveTargetGame: Game? = null
+
+              val addRoms = registerForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
+                  onRomsPicked(uris)
+              }
+              val pickCover = registerForActivityResult(ActivityResultContracts.GetContent()) { uri ->
+                  onCoverPicked(uri)
+              }
+              val pickZip = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+                  if (uri != null) mods.onZipPicked(uri)
+              }
+              val pickSave = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+                  val target = saveTargetGame
+                  saveTargetGame = null
+                  if (uri != null) {
+                      if (target != null) saves.onSavePickedFor(uri, target) else saves.onSavePicked(uri)
+                  }
+              }
+              val createSave = registerForActivityResult(ActivityResultContracts.CreateDocument("application/octet-stream")) { uri ->
+                  if (uri != null) saves.onExportTo(uri)
+              }
+
+              private fun dp(v: Int) = Ui.dp(this, v)
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  settings = Settings(this)
+                  library = Library(this)
+                  games = GamesTab(this)
+                  mods = ModsTab(this)
+                  saves = SavesTab(this)
+                  config = SettingsTab(this)
+
+                  val root = LinearLayout(this)
+                  root.orientation = LinearLayout.VERTICAL
+                  root.setBackgroundColor(Ui.BG)
+
+                  holder = FrameLayout(this)
+                  root.addView(holder, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f))
+
+                  val nav = LinearLayout(this)
+                  nav.orientation = LinearLayout.HORIZONTAL
+                  nav.setBackgroundColor(Ui.CARD)
+                  val labels = listOf("🎮\nJogos", "🧩\nMods", "💾\nSaves", "⚙️\nConfig")
+                  val items = ArrayList<TextView>()
+                  for ((i, l) in labels.withIndex()) {
+                      val t = TextView(this)
+                      t.text = l
+                      t.gravity = Gravity.CENTER
+                      t.textSize = 12f
+                      t.setPadding(0, dp(8), 0, dp(8))
+                      t.setOnClickListener { select(i) }
+                      nav.addView(t, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+                      items.add(t)
+                  }
+                  navItems = items
+                  root.addView(nav)
+                  setContentView(root)
+                  select(0)
+
+                  // reconhece os jogos e busca as capas que faltam, em segundo plano
+                  val pending = library.games.filter { !it.recognized || it.cover == null }
+                  if (pending.isNotEmpty()) Covers.autoAsync(this, library, pending) { games.refresh() }
+
+                  val prefs = getSharedPreferences("n64emu", MODE_PRIVATE)
+                  if (prefs.getBoolean("game_running", false)) {
+                      prefs.edit().putBoolean("game_running", false).apply()
+                      Toast.makeText(this, "O jogo anterior fechou de forma inesperada. Veja Config > Diagnóstico.", Toast.LENGTH_LONG).show()
+                  }
+              }
+
+              private fun select(i: Int) {
+                  holder.removeAllViews()
+                  val v: View = when (i) {
+                      0 -> { games.refresh(); games.view }
+                      1 -> { mods.refresh(); mods.view }
+                      2 -> { saves.refresh(); saves.view }
+                      else -> config.view
+                  }
+                  holder.addView(v, FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
+                  for ((idx, t) in navItems.withIndex()) {
+                      t.setTextColor(if (idx == i) Ui.ACCENT else Ui.SUB)
+                  }
+              }
+
+              fun launchGame(g: Game) {
+                  val it = Intent(this, EmulatorActivity::class.java)
+                  it.data = Uri.parse(g.uri)
+                  it.putExtra("title", g.title)
+                  it.putExtra("saveKey", g.saveKey)
+                  startActivity(it)
+              }
+
+              private fun onRomsPicked(uris: List<Uri>) {
+                  var added = 0
+                  for (uri in uris) {
+                      try {
+                          contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                      } catch (e: Exception) {
+                      }
+                      if (library.games.any { it.uri == uri.toString() }) continue
+                      val g = Game(UUID.randomUUID().toString(), uri.toString(), Rom.displayName(this, uri), Rom.internalName(this, uri), null)
+                      library.add(g)
+                      added++
+                      Covers.autoAsync(this, library, listOf(g)) { games.refresh() }
+                  }
+                  games.refresh()
+                  if (added == 0 && uris.isNotEmpty()) {
+                      Toast.makeText(this, "Esse jogo já está na lista.", Toast.LENGTH_SHORT).show()
+                  }
+              }
+
+              private fun onCoverPicked(uri: Uri?) {
+                  val id = coverTarget
+                  if (uri == null || id == null) return
+                  Thread {
+                      val p = Covers.saveFromUri(this, uri, id)
+                      runOnUiThread {
+                          if (p != null) {
+                              library.find(id)?.cover = p
+                              library.save()
+                              games.refresh()
+                          } else {
+                              Toast.makeText(this, "Não consegui usar essa imagem.", Toast.LENGTH_LONG).show()
+                          }
+                      }
+                  }.start()
+              }
+          }
+          N64EMU_EOF
+          cat > app/src/main/java/dev/n64emu/app/Models.kt <<'N64EMU_EOF'
+          package dev.n64emu.app
+
+          import android.content.Context
+          import org.json.JSONArray
+          import org.json.JSONObject
+
+          /** Nome seguro para arquivo (usado nos saves e nas pastas de texturas). */
+          fun safeFileName(s: String): String = s.replace(Regex("[/\\\\:*?\"<>|]"), "_").trim().ifEmpty { "jogo" }
+
+          /**
+           * title: nome mostrado (vira o nome oficial quando o jogo é reconhecido).
+           * saveKey: nome do arquivo de save (.srm). Nunca muda depois de criado, para não perder o save.
+           * crc: CRC32 da ROM (formato z64), usado para reconhecer o jogo.
+           */
+          data class Game(
+              val id: String,
+              val uri: String,
+              var title: String,
+              val romName: String,
+              var cover: String?,
+              var crc: String? = null,
+              var saveKey: String = safeFileName(title),
+              var recognized: Boolean = false
+          )
+
+          class Library(ctx: Context) {
+              private val prefs = ctx.getSharedPreferences("n64emu_lib", Context.MODE_PRIVATE)
+              val games = mutableListOf<Game>()
+
+              init { load() }
+
+              private fun load() {
+                  games.clear()
+                  try {
+                      val arr = JSONArray(prefs.getString("games", "[]"))
+                      for (i in 0 until arr.length()) {
+                          val o = arr.getJSONObject(i)
+                          val cover = if (o.has("cover") && !o.isNull("cover")) o.getString("cover") else null
+                          val title = o.getString("title")
+                          val crc = if (o.has("crc") && !o.isNull("crc")) o.getString("crc") else null
+                          val key = o.optString("saveKey", "").ifEmpty { safeFileName(title) }
+                          games.add(Game(o.getString("id"), o.getString("uri"), title, o.optString("romName"), cover, crc, key, o.optBoolean("recognized", false)))
+                      }
+                  } catch (e: Exception) {
+                      games.clear()
+                  }
+              }
+
+              @Synchronized
+              fun save() {
+                  val arr = JSONArray()
+                  for (g in games) {
+                      val o = JSONObject()
+                      o.put("id", g.id)
+                      o.put("uri", g.uri)
+                      o.put("title", g.title)
+                      o.put("romName", g.romName)
+                      o.put("saveKey", g.saveKey)
+                      o.put("recognized", g.recognized)
+                      if (g.cover != null) o.put("cover", g.cover)
+                      if (g.crc != null) o.put("crc", g.crc)
+                      arr.put(o)
+                  }
+                  prefs.edit().putString("games", arr.toString()).apply()
+              }
+
+              @Synchronized
+              fun add(g: Game) {
+                  if (games.none { it.uri == g.uri }) {
+                      // dois jogos com o mesmo nome de arquivo não podem dividir o mesmo save
+                      var key = g.saveKey
+                      var n = 2
+                      while (games.any { it.saveKey == key }) { key = g.saveKey + "-" + n; n++ }
+                      g.saveKey = key
+                      games.add(g)
+                      save()
+                  }
+              }
+
+              @Synchronized
+              fun remove(id: String) {
+                  games.removeAll { it.id == id }
+                  save()
+              }
+
+              fun find(id: String): Game? = games.firstOrNull { it.id == id }
+          }
+          N64EMU_EOF
+          cat > app/src/main/java/dev/n64emu/app/ModsTab.kt <<'N64EMU_EOF'
+          package dev.n64emu.app
+
+          import android.net.Uri
+          import android.widget.LinearLayout
+          import android.widget.ScrollView
+          import android.widget.Toast
+          import androidx.appcompat.app.AlertDialog
+          import java.io.File
+          import java.util.zip.ZipInputStream
+
+          class ModsTab(private val act: MainActivity) {
+              val view = ScrollView(act)
+              private val col = LinearLayout(act)
+
+              private fun dp(v: Int) = Ui.dp(act, v)
+
+              init {
+                  col.orientation = LinearLayout.VERTICAL
+                  col.setPadding(dp(12), dp(12), dp(12), dp(12))
+                  view.addView(col)
+              }
+
+              fun refresh() {
+                  col.removeAllViews()
+                  col.addView(Ui.text(act, "Mods", 26f, bold = true))
+
+                  val tex = Ui.card(act)
+                  tex.addView(Ui.text(act, "Texturas HD", 18f, bold = true))
+                  tex.addView(Ui.text(act, "Importe um pacote .zip e escolha o jogo. Ative em Config > Texturas HD.", 13f, Ui.SUB))
+                  tex.addView(Ui.button(act, "Importar pacote (.zip)") { act.pickZip.launch(arrayOf("*/*")) })
+                  val packs = Storage.hiresDir(act).listFiles()?.filter { it.isDirectory }?.sortedBy { it.name } ?: emptyList()
+                  if (packs.isEmpty()) {
+                      val t = Ui.text(act, "Nenhum pacote instalado.", 14f, Ui.SUB)
+                      t.setPadding(0, dp(10), 0, 0)
+                      tex.addView(t)
+                  }
+                  for (p in packs) {
+                      val row = LinearLayout(act)
+                      row.orientation = LinearLayout.HORIZONTAL
+                      row.setPadding(0, dp(10), 0, 0)
+                      val n = p.walkTopDown().count { it.isFile }
+                      val label = Ui.text(act, "${p.name}  ($n arquivos)", 14f)
+                      row.addView(label, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+                      row.addView(Ui.button(act, "Apagar") {
+                          AlertDialog.Builder(act)
+                              .setTitle("Apagar ${p.name}?")
+                              .setPositiveButton("Apagar") { _, _ -> p.deleteRecursively(); refresh() }
+                              .setNegativeButton("Cancelar", null)
+                              .show()
+                      })
+                      tex.addView(row)
+                  }
+                  col.addView(tex)
+
+                  val hacks = Ui.card(act)
+                  hacks.addView(Ui.text(act, "ROM hacks", 18f, bold = true))
+                  hacks.addView(Ui.text(act, "ROMs modificadas entram na lista de Jogos como qualquer outra ROM.", 13f, Ui.SUB))
+                  hacks.addView(Ui.button(act, "Adicionar ROM modificada") { act.addRoms.launch(arrayOf("*/*")) })
+                  col.addView(hacks)
+
+                  val manual = Ui.card(act)
+                  manual.addView(Ui.text(act, "Pasta manual de texturas", 18f, bold = true))
+                  val path = Ui.text(act, Storage.hiresDir(act).absolutePath + "/NOME INTERNO DO JOGO/", 12f, Ui.SUB)
+                  path.setTextIsSelectable(true)
+                  manual.addView(path)
+                  col.addView(manual)
+              }
+
+              fun onZipPicked(uri: Uri) {
+                  val list = act.library.games
+                  if (list.isEmpty()) {
+                      Toast.makeText(act, "Adicione um jogo primeiro na aba Jogos.", Toast.LENGTH_LONG).show()
+                      return
+                  }
+                  val names = list.map { it.title }.toTypedArray()
+                  AlertDialog.Builder(act)
+                      .setTitle("Pacote para qual jogo?")
+                      .setItems(names) { _, i ->
+                          val g = list[i]
+                          val raw = if (g.romName.isNotBlank()) g.romName else g.title.uppercase()
+                          val folder = raw.replace(Regex("[/\\\\:*?\"<>|]"), "_")
+                          Toast.makeText(act, "Importando...", Toast.LENGTH_SHORT).show()
+                          Thread {
+                              val n = try { extract(uri, File(Storage.hiresDir(act), folder)) } catch (e: Exception) { -1 }
+                              act.runOnUiThread {
+                                  val msg = if (n >= 0) "Importado: $n arquivos" else "Falha ao importar"
+                                  Toast.makeText(act, msg, Toast.LENGTH_LONG).show()
+                                  refresh()
+                              }
+                          }.start()
+                      }
+                      .show()
+              }
+
+              private fun extract(uri: Uri, dest: File): Int {
+                  val tops = HashSet<String>()
+                  var allNested = true
+                  val in1 = act.contentResolver.openInputStream(uri) ?: return -1
+                  ZipInputStream(in1).use { z ->
+                      var e = z.nextEntry
+                      while (e != null) {
+                          val n = e.name.replace('\\', '/')
+                          if (!n.startsWith("__MACOSX")) {
+                              val i = n.indexOf('/')
+                              if (i < 0) allNested = false else tops.add(n.substring(0, i))
+                          }
+                          e = z.nextEntry
+                      }
+                  }
+                  val strip = allNested && tops.size == 1
+                  dest.mkdirs()
+                  val base = dest.canonicalPath
+                  var count = 0
+                  val in2 = act.contentResolver.openInputStream(uri) ?: return -1
+                  ZipInputStream(in2).use { z ->
+                      var e = z.nextEntry
+                      while (e != null) {
+                          val orig = e.name.replace('\\', '/')
+                          if (!e.isDirectory && !orig.startsWith("__MACOSX")) {
+                              val n = if (strip) orig.substringAfter('/') else orig
+                              if (n.isNotEmpty()) {
+                                  val out = File(dest, n)
+                                  if (out.canonicalPath.startsWith(base)) {
+                                      out.parentFile?.mkdirs()
+                                      out.outputStream().use { o -> z.copyTo(o) }
+                                      count++
+                                  }
+                              }
+                          }
+                          e = z.nextEntry
+                      }
+                  }
+                  return count
+              }
+          }
+          N64EMU_EOF
+          cat > app/src/main/java/dev/n64emu/app/NativeBridge.kt <<'N64EMU_EOF'
+          package dev.n64emu.app
+
+          import android.view.Surface
+
+          /** Ponte JNI para o host libretro (núcleo mupen64plus_next + GLideN64). */
+          object NativeBridge {
+              init { System.loadLibrary("n64emu") }
+
+              external fun init(libPath: String, systemDir: String, saveDir: String, logPath: String)
+              external fun setOption(key: String, value: String)
+              external fun setSaveName(name: String) // nome base do arquivo .srm dentro da pasta de saves
+              external fun getStatus(): String
+              external fun start(romPath: String, surface: Surface)
+              external fun pause()
+              external fun resume()
+              external fun stop()
+              external fun setButton(id: Int, pressed: Boolean)
+              external fun setAnalog(which: Int, x: Float, y: Float) // 0 = analógico, 1 = botões C
+          }
+          N64EMU_EOF
+          cat > app/src/main/java/dev/n64emu/app/Rom.kt <<'N64EMU_EOF'
+          package dev.n64emu.app
+
+          import android.content.Context
+          import android.net.Uri
+          import android.provider.OpenableColumns
+          import java.util.zip.CRC32
+
+          object Rom {
+              fun displayName(ctx: Context, uri: Uri): String {
+                  var name: String? = null
+                  try {
+                      val c = ctx.contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)
+                      if (c != null) {
+                          if (c.moveToFirst()) name = c.getString(0)
+                          c.close()
+                      }
+                  } catch (e: Exception) {
+                  }
+                  val n = name ?: uri.lastPathSegment ?: "ROM"
+                  return n.substringBeforeLast('.')
+              }
+
+              /** Converte um bloco para a ordem de bytes z64 (big-endian). mode: 0 = z64, 1 = v64, 2 = n64. */
+              private fun normalize(buf: ByteArray, len: Int, mode: Int) {
+                  when (mode) {
+                      1 -> {
+                          var i = 0
+                          while (i + 1 < len) { val t = buf[i]; buf[i] = buf[i + 1]; buf[i + 1] = t; i += 2 }
+                      }
+                      2 -> {
+                          var i = 0
+                          while (i + 3 < len) {
+                              val a = buf[i]; val b = buf[i + 1]
+                              buf[i] = buf[i + 3]; buf[i + 1] = buf[i + 2]; buf[i + 2] = b; buf[i + 3] = a
+                              i += 4
+                          }
+                      }
+                  }
+              }
+
+              private fun modeOf(first: Int): Int = when (first and 0xFF) {
+                  0x80 -> 0
+                  0x37 -> 1
+                  0x40 -> 2
+                  else -> -1
+              }
+
+              /** Primeiros 0x40 bytes do cabeçalho, já em ordem z64. */
+              private fun header(ctx: Context, uri: Uri): ByteArray? {
+                  try {
+                      val buf = ByteArray(0x40)
+                      val ins = ctx.contentResolver.openInputStream(uri) ?: return null
+                      var off = 0
+                      ins.use {
+                          while (off < buf.size) {
+                              val r = it.read(buf, off, buf.size - off)
+                              if (r < 0) break
+                              off += r
+                          }
+                      }
+                      if (off < buf.size) return null
+                      val mode = modeOf(buf[0].toInt())
+                      if (mode < 0) return null
+                      normalize(buf, buf.size, mode)
+                      return buf
+                  } catch (e: Exception) {
+                      return null
+                  }
+              }
+
+              /** Nome interno do cabeçalho da ROM (usado como nome da pasta de texturas HD). */
+              fun internalName(ctx: Context, uri: Uri): String {
+                  val h = header(ctx, uri) ?: return ""
+                  return String(h, 0x20, 20, Charsets.US_ASCII).trim { it <= ' ' || it == '\u0000' }
+              }
+
+              /** Código de 4 letras do jogo (ex.: NSME). */
+              fun gameCode(ctx: Context, uri: Uri): String {
+                  val h = header(ctx, uri) ?: return ""
+                  return String(h, 0x3B, 4, Charsets.US_ASCII).trim { it <= ' ' || it == '\u0000' }
+              }
+
+              /** CRC32 da ROM inteira em ordem z64 (é o CRC usado nas listas No-Intro). Null se não for uma ROM de N64. */
+              fun crc32(ctx: Context, uri: Uri): String? {
+                  try {
+                      val ins = ctx.contentResolver.openInputStream(uri) ?: return null
+                      val crc = CRC32()
+                      val buf = ByteArray(1 shl 16)
+                      var mode = -1
+                      ins.use {
+                          while (true) {
+                              var n = 0
+                              while (n < buf.size) {
+                                  val r = it.read(buf, n, buf.size - n)
+                                  if (r < 0) break
+                                  n += r
+                              }
+                              if (n <= 0) break
+                              if (mode == -1) {
+                                  mode = modeOf(buf[0].toInt())
+                                  if (mode < 0) return null
+                              }
+                              normalize(buf, n, mode)
+                              crc.update(buf, 0, n)
+                              if (n < buf.size) break
+                          }
+                      }
+                      return String.format("%08X", crc.value)
+                  } catch (e: Exception) {
+                      return null
+                  }
+              }
+          }
+          N64EMU_EOF
+          cat > app/src/main/java/dev/n64emu/app/Settings.kt <<'N64EMU_EOF'
+          package dev.n64emu.app
+
+          import android.content.Context
+
+          class Settings(ctx: Context) {
+              private val p = ctx.getSharedPreferences("n64emu", Context.MODE_PRIVATE)
+              var resolutionFactor: Int
+                  get() = p.getInt("res", 2)
+                  set(v) = p.edit().putInt("res", v.coerceIn(1, 10)).apply()
+              var texturePacks: Boolean
+                  get() = p.getBoolean("tex", true)
+                  set(v) = p.edit().putBoolean("tex", v).apply()
+              var aspect: String
+                  get() = p.getString("aspect", "4:3") ?: "4:3"
+                  set(v) = p.edit().putString("aspect", v).apply()
+              var showControls: Boolean
+                  get() = p.getBoolean("show_controls", true)
+                  set(v) = p.edit().putBoolean("show_controls", v).apply()
+              var controlsAlpha: Int
+                  get() = p.getInt("controls_alpha", 70)
+                  set(v) = p.edit().putInt("controls_alpha", v.coerceIn(20, 100)).apply()
+          }
+          N64EMU_EOF
+          cat > app/src/main/java/dev/n64emu/app/SettingsTab.kt <<'N64EMU_EOF'
+          package dev.n64emu.app
+
+          import android.content.ClipData
+          import android.content.ClipboardManager
+          import android.content.Context
+          import android.content.Intent
+          import android.content.res.ColorStateList
+          import android.view.View
+          import android.widget.LinearLayout
+          import android.widget.RadioButton
+          import android.widget.RadioGroup
+          import android.widget.ScrollView
+          import android.widget.SeekBar
+          import android.widget.TextView
+          import android.widget.Toast
+          import androidx.appcompat.app.AlertDialog
+          import androidx.appcompat.widget.SwitchCompat
+
+          class SettingsTab(private val act: MainActivity) {
+              val view = ScrollView(act)
+
+              private fun tint(s: SeekBar) {
+                  s.progressTintList = ColorStateList.valueOf(Ui.ACCENT)
+                  s.thumbTintList = ColorStateList.valueOf(Ui.ACCENT)
+              }
+
+              private fun seek(max: Int, progress: Int, onChange: (Int) -> Unit): SeekBar {
+                  val s = SeekBar(act)
+                  s.max = max
+                  s.progress = progress
+                  tint(s)
+                  s.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                      override fun onProgressChanged(sb: SeekBar?, v: Int, fromUser: Boolean) { onChange(v) }
+                      override fun onStartTrackingTouch(sb: SeekBar?) {}
+                      override fun onStopTrackingTouch(sb: SeekBar?) {}
+                  })
+                  return s
+              }
+
+              private fun toggle(label: String, on: Boolean, onChange: (Boolean) -> Unit): SwitchCompat {
+                  val sw = SwitchCompat(act)
+                  sw.text = label
+                  sw.setTextColor(Ui.TEXT)
+                  sw.isChecked = on
+                  sw.setOnCheckedChangeListener { _, c -> onChange(c) }
+                  return sw
+              }
+
+              private fun showLog() {
+                  val f = Storage.logFile(act)
+                  val txt = if (f.exists()) f.readText().takeLast(8000) else "Nenhum log ainda. Abra um jogo primeiro."
+                  val tv = TextView(act)
+                  tv.text = txt
+                  tv.textSize = 11f
+                  tv.setTextIsSelectable(true)
+                  val p = Ui.dp(act, 12)
+                  tv.setPadding(p, p, p, p)
+                  val sc = ScrollView(act)
+                  sc.addView(tv)
+                  AlertDialog.Builder(act)
+                      .setTitle("Último log")
+                      .setView(sc)
+                      .setPositiveButton("Copiar") { _, _ ->
+                          val cm = act.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                          cm.setPrimaryClip(ClipData.newPlainText("log", txt))
+                          Toast.makeText(act, "Log copiado.", Toast.LENGTH_SHORT).show()
+                      }
+                      .setNegativeButton("Fechar", null)
+                      .show()
+              }
+
+              init {
+                  val s = act.settings
+                  val col = LinearLayout(act)
+                  col.orientation = LinearLayout.VERTICAL
+                  val pad = Ui.dp(act, 12)
+                  col.setPadding(pad, pad, pad, pad)
+                  col.addView(Ui.text(act, "Configuração do jogo", 26f, bold = true))
+
+                  val video = Ui.card(act)
+                  video.addView(Ui.text(act, "Vídeo", 18f, bold = true))
+                  val resLabel = Ui.text(act, "Resolução interna: ${s.resolutionFactor}x", 15f)
+                  video.addView(resLabel)
+                  video.addView(seek(9, s.resolutionFactor - 1) { v ->
+                      s.resolutionFactor = v + 1
+                      resLabel.text = "Resolução interna: ${v + 1}x"
+                  })
+                  video.addView(Ui.text(act, "Acima de 4x pode travar em celulares mais fracos.", 12f, Ui.SUB))
+                  val ptxt = Ui.text(act, "Proporção da tela", 15f)
+                  ptxt.setPadding(0, Ui.dp(act, 10), 0, 0)
+                  video.addView(ptxt)
+                  val options = listOf(
+                      Pair("4:3", "4:3"),
+                      Pair("16:9 (ajustado)", "16:9 adjusted"),
+                      Pair("16:9 (esticado)", "16:9")
+                  )
+                  val group = RadioGroup(act)
+                  for (o in options) {
+                      val rb = RadioButton(act)
+                      rb.id = View.generateViewId()
+                      rb.text = o.first
+                      rb.setTextColor(Ui.TEXT)
+                      rb.isChecked = s.aspect == o.second
+                      rb.setOnClickListener { s.aspect = o.second }
+                      group.addView(rb)
+                  }
+                  video.addView(group)
+                  col.addView(video)
+
+                  val tex = Ui.card(act)
+                  tex.addView(Ui.text(act, "Texturas e mods", 18f, bold = true))
+                  tex.addView(toggle("Texturas HD / mods", s.texturePacks) { s.texturePacks = it })
+                  col.addView(tex)
+
+                  val ctl = Ui.card(act)
+                  ctl.addView(Ui.text(act, "Controles na tela", 18f, bold = true))
+                  ctl.addView(toggle("Mostrar controles", s.showControls) { s.showControls = it })
+                  val alphaLabel = Ui.text(act, "Opacidade: ${s.controlsAlpha}%", 15f)
+                  ctl.addView(alphaLabel)
+                  ctl.addView(seek(80, s.controlsAlpha - 20) { v ->
+                      s.controlsAlpha = v + 20
+                      alphaLabel.text = "Opacidade: ${v + 20}%"
+                  })
+                  ctl.addView(Ui.text(act, "O analógico aparece onde você encosta o dedo, perto da posição dele na tela.", 12f, Ui.SUB))
+                  ctl.addView(Ui.button(act, "Editar botões na tela") { act.startActivity(Intent(act, ControlsEditorActivity::class.java)) })
+                  ctl.addView(Ui.text(act, "Mova, mude o tamanho ou oculte cada botão. As mudanças valem no próximo jogo.", 12f, Ui.SUB))
+                  col.addView(ctl)
+
+                  val diag = Ui.card(act)
+                  diag.addView(Ui.text(act, "Diagnóstico", 18f, bold = true))
+                  diag.addView(Ui.text(act, "Se um jogo não abrir ou fechar sozinho, veja o log e copie para me mandar.", 13f, Ui.SUB))
+                  diag.addView(Ui.button(act, "Ver último log") { showLog() })
+                  col.addView(diag)
+
+                  col.addView(Ui.text(act, "As mudanças valem na próxima vez que você abrir um jogo.", 13f, Ui.SUB))
+                  view.addView(col)
+              }
+          }
+          N64EMU_EOF
+          cat > app/src/main/java/dev/n64emu/app/Storage.kt <<'N64EMU_EOF'
+          package dev.n64emu.app
+
+          import android.content.Context
+          import java.io.File
+
+          object Storage {
+              private fun base(ctx: Context): File = ctx.getExternalFilesDir(null) ?: ctx.filesDir
+              fun systemDir(ctx: Context): File = File(base(ctx), "system").apply { mkdirs() }
+              fun hiresDir(ctx: Context): File = File(systemDir(ctx), "Mupen64plus/hires_texture").apply { mkdirs() }
+              fun savesDir(ctx: Context): File = File(base(ctx), "saves").apply { mkdirs() }
+              fun logFile(ctx: Context): File = File(base(ctx), "last_log.txt")
+          }
+          N64EMU_EOF
+          cat > app/src/main/java/dev/n64emu/app/Ui.kt <<'N64EMU_EOF'
+          package dev.n64emu.app
+
+          import android.content.Context
+          import android.graphics.Typeface
+          import android.graphics.drawable.GradientDrawable
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import android.widget.TextView
+
+          object Ui {
+              val BG = 0xFF101018.toInt()
+              val CARD = 0xFF1C1C28.toInt()
+              val ACCENT = 0xFFFF3B30.toInt()
+              val TEXT = 0xFFFFFFFF.toInt()
+              val SUB = 0xFFA0A0B0.toInt()
+
+              fun dp(ctx: Context, v: Int): Int = (v * ctx.resources.displayMetrics.density).toInt()
+
+              fun rounded(color: Int, radius: Int): GradientDrawable {
+                  val d = GradientDrawable()
+                  d.setColor(color)
+                  d.cornerRadius = radius.toFloat()
+                  return d
+              }
+
+              fun text(ctx: Context, s: String, size: Float = 16f, color: Int = TEXT, bold: Boolean = false): TextView {
+                  val t = TextView(ctx)
+                  t.text = s
+                  t.textSize = size
+                  t.setTextColor(color)
+                  if (bold) t.setTypeface(t.typeface, Typeface.BOLD)
+                  return t
+              }
+
+              fun button(ctx: Context, s: String, onClick: () -> Unit): Button {
+                  val b = Button(ctx)
+                  b.text = s
+                  b.setTextColor(TEXT)
+                  b.setAllCaps(false)
+                  b.background = rounded(ACCENT, dp(ctx, 10))
+                  b.setOnClickListener { onClick() }
+                  return b
+              }
+
+              fun card(ctx: Context): LinearLayout {
+                  val c = LinearLayout(ctx)
+                  c.orientation = LinearLayout.VERTICAL
+                  c.background = rounded(CARD, dp(ctx, 14))
+                  val p = dp(ctx, 14)
+                  c.setPadding(p, p, p, p)
+                  val lp = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
+                  lp.bottomMargin = dp(ctx, 12)
+                  c.layoutParams = lp
+                  return c
+              }
+          }
+          N64EMU_EOF
+          cat > app/src/main/java/dev/n64emu/app/ControlsEditorActivity.kt <<'N64EMU_EOF'
+          package dev.n64emu.app
+
+          import android.os.Bundle
+          import android.view.Gravity
+          import android.view.ViewGroup
+          import android.widget.Button
+          import android.widget.FrameLayout
+          import android.widget.LinearLayout
+          import android.widget.SeekBar
+          import android.widget.TextView
+          import android.content.res.ColorStateList
+          import androidx.appcompat.app.AppCompatActivity
+          import androidx.core.view.WindowCompat
+          import androidx.core.view.WindowInsetsCompat
+          import androidx.core.view.WindowInsetsControllerCompat
+
+          /** Editor dos botões na tela: arrastar para mover, barra para o tamanho, ocultar, padrão. */
+          class ControlsEditorActivity : AppCompatActivity() {
+              private fun dp(v: Int) = Ui.dp(this, v)
+
+              private fun small(b: Button): Button {
+                  b.textSize = 12f
+                  b.minWidth = 0
+                  b.minimumWidth = 0
+                  b.setPadding(dp(6), 0, dp(6), 0)
+                  return b
+              }
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  val root = FrameLayout(this)
+                  root.setBackgroundColor(0xFF15151D.toInt())
+                  val cv = ControlsView(this, true)
+                  root.addView(cv, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+
+                  val panel = LinearLayout(this)
+                  panel.orientation = LinearLayout.VERTICAL
+                  panel.background = Ui.rounded(0xE61C1C28.toInt(), dp(12))
+                  panel.setPadding(dp(10), dp(8), dp(10), dp(8))
+
+                  val title = Ui.text(this, "Toque num botão e arraste para mover", 13f, Ui.SUB)
+                  title.gravity = Gravity.CENTER
+                  panel.addView(title)
+
+                  val sizeLabel = Ui.text(this, "Tamanho: 100%", 12f)
+                  panel.addView(sizeLabel)
+                  val seek = SeekBar(this)
+                  seek.max = 150  // 50% .. 200%
+                  seek.progress = 50
+                  seek.progressTintList = ColorStateList.valueOf(Ui.ACCENT)
+                  seek.thumbTintList = ColorStateList.valueOf(Ui.ACCENT)
+                  seek.isEnabled = false
+                  seek.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                      override fun onProgressChanged(sb: SeekBar?, v: Int, fromUser: Boolean) {
+                          if (!fromUser) return
+                          sizeLabel.text = "Tamanho: ${v + 50}%"
+                          cv.setScalePercent(v + 50)
+                      }
+                      override fun onStartTrackingTouch(sb: SeekBar?) {}
+                      override fun onStopTrackingTouch(sb: SeekBar?) {}
+                  })
+                  panel.addView(seek)
+
+                  val row = LinearLayout(this)
+                  row.orientation = LinearLayout.HORIZONTAL
+                  row.setPadding(0, dp(4), 0, 0)
+                  val hide = small(Ui.button(this, "Ocultar") { cv.toggleVisible() })
+                  hide.isEnabled = false
+                  val reset = small(Ui.button(this, "Padrão") { cv.resetLayout() })
+                  val cancel = small(Ui.button(this, "Cancelar") { finish() })
+                  val ok = small(Ui.button(this, "Salvar") { cv.saveLayout(); finish() })
+                  val lp = { LinearLayout.LayoutParams(0, dp(40), 1f).apply { setMargins(dp(2), 0, dp(2), 0) } }
+                  row.addView(hide, lp())
+                  row.addView(reset, lp())
+                  row.addView(cancel, lp())
+                  row.addView(ok, lp())
+                  panel.addView(row)
+
+                  cv.onSelection = { name, percent, visible, canHide ->
+                      title.text = if (name == null) "Toque num botão e arraste para mover" else "Selecionado: $name"
+                      seek.isEnabled = name != null
+                      seek.progress = (percent - 50).coerceIn(0, 150)
+                      sizeLabel.text = "Tamanho: $percent%"
+                      hide.isEnabled = canHide
+                      hide.text = if (visible) "Ocultar" else "Mostrar"
+                  }
+
+                  val w = (resources.displayMetrics.widthPixels * 0.46f).toInt()
+                  root.addView(panel, FrameLayout.LayoutParams(w, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.TOP or Gravity.CENTER_HORIZONTAL))
+                  setContentView(root)
+
+                  WindowCompat.setDecorFitsSystemWindows(window, false)
+                  val ctl = WindowInsetsControllerCompat(window, root)
+                  ctl.hide(WindowInsetsCompat.Type.systemBars())
+                  ctl.systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+              }
+          }
+          N64EMU_EOF
+          cat > app/src/main/java/dev/n64emu/app/ControlsLayout.kt <<'N64EMU_EOF'
+          package dev.n64emu.app
+
+          import android.content.Context
+          import org.json.JSONObject
+
+          /** Posição (fração da tela), tamanho e visibilidade de cada item dos controles na tela. */
+          class ItemPrefs(val x: Float, val y: Float, val scale: Float, val visible: Boolean)
+
+          object ControlsLayout {
+              private const val KEY = "layout"
+
+              private fun prefs(ctx: Context) = ctx.getSharedPreferences("n64emu_controls", Context.MODE_PRIVATE)
+
+              fun load(ctx: Context): Map<Int, ItemPrefs> {
+                  val out = HashMap<Int, ItemPrefs>()
+                  try {
+                      val o = JSONObject(prefs(ctx).getString(KEY, "{}") ?: "{}")
+                      for (k in o.keys()) {
+                          val v = o.getJSONObject(k)
+                          out[k.toInt()] = ItemPrefs(
+                              v.getDouble("x").toFloat(), v.getDouble("y").toFloat(),
+                              v.optDouble("s", 1.0).toFloat(), v.optBoolean("v", true)
+                          )
+                      }
+                  } catch (e: Exception) {
+                      out.clear()
+                  }
+                  return out
+              }
+
+              fun save(ctx: Context, items: Map<Int, ItemPrefs>) {
+                  val o = JSONObject()
+                  for ((k, v) in items) {
+                      val j = JSONObject()
+                      j.put("x", v.x.toDouble())
+                      j.put("y", v.y.toDouble())
+                      j.put("s", v.scale.toDouble())
+                      j.put("v", v.visible)
+                      o.put(k.toString(), j)
+                  }
+                  prefs(ctx).edit().putString(KEY, o.toString()).apply()
+              }
+
+              fun reset(ctx: Context) {
+                  prefs(ctx).edit().remove(KEY).apply()
+              }
+          }
+          N64EMU_EOF
+          cat > app/src/main/java/dev/n64emu/app/Saves.kt <<'N64EMU_EOF'
+          package dev.n64emu.app
+
+          import android.content.Context
+          import android.net.Uri
+          import android.provider.OpenableColumns
+          import java.io.File
+          import java.io.InputStream
+
+          /**
+           * Saves ficam em Storage.savesDir como "<saveKey>.srm" (o arquivo que o host grava sozinho).
+           * Importar .eep/.mpk/.sra/.fla copia o arquivo para "<saveKey>.<ext>"; o host aplica por cima
+           * do .srm na próxima vez que o jogo abre (ver loadSram no native-lib.cpp).
+           */
+          object Saves {
+              const val SRM_SIZE = 0x48800
+
+              fun file(ctx: Context, g: Game): File = File(Storage.savesDir(ctx), g.saveKey + ".srm")
+
+              private fun pending(ctx: Context, g: Game): List<File> =
+                  listOf("eep", "mpk", "sra", "fla").map { File(Storage.savesDir(ctx), g.saveKey + "." + it) }.filter { it.exists() }
+
+              fun hasPending(ctx: Context, g: Game): Boolean = pending(ctx, g).isNotEmpty()
+
+              fun fileName(ctx: Context, uri: Uri): String {
+                  var name: String? = null
+                  try {
+                      val c = ctx.contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)
+                      if (c != null) {
+                          if (c.moveToFirst()) name = c.getString(0)
+                          c.close()
+                      }
+                  } catch (e: Exception) {
+                  }
+                  return name ?: uri.lastPathSegment ?: ""
+              }
+
+              private fun readLimited(i: InputStream, max: Int): ByteArray? {
+                  val out = java.io.ByteArrayOutputStream()
+                  val buf = ByteArray(8192)
+                  while (true) {
+                      val r = i.read(buf)
+                      if (r < 0) break
+                      out.write(buf, 0, r)
+                      if (out.size() > max) return null
+                  }
+                  return out.toByteArray()
+              }
+
+              /** Importa um arquivo de save para o jogo. Devolve a mensagem para mostrar ao usuário. */
+              fun importFrom(ctx: Context, uri: Uri, g: Game): String {
+                  val data = try {
+                      ctx.contentResolver.openInputStream(uri)?.use { readLimited(it, 2_000_000) }
+                  } catch (e: Exception) {
+                      null
+                  } ?: return "Não consegui ler esse arquivo (ou ele é grande demais para ser um save)."
+                  val ext = fileName(ctx, uri).substringAfterLast('.', "").lowercase()
+                  val dir = Storage.savesDir(ctx)
+                  when (ext) {
+                      "srm" -> {
+                          val dest = file(ctx, g)
+                          if (dest.exists()) dest.copyTo(File(dir, g.saveKey + ".srm.bak"), overwrite = true)
+                          dest.writeBytes(data)
+                          return if (data.size == SRM_SIZE) "Save importado. Abra o jogo para usar."
+                          else "Save importado, mas o tamanho (${data.size} bytes) é diferente do esperado ($SRM_SIZE). Se o jogo não reconhecer, o save é de outro núcleo."
+                      }
+                      "eep" -> {
+                          if (data.size != 512 && data.size != 2048) return "Arquivo .eep com tamanho inesperado (${data.size} bytes). Esperado 512 ou 2048."
+                          File(dir, g.saveKey + ".eep").writeBytes(data)
+                      }
+                      "mpk", "cpk" -> {
+                          if (data.size != 32768) return "Arquivo de Controller Pak com tamanho inesperado (${data.size} bytes). Esperado 32768."
+                          File(dir, g.saveKey + ".mpk").writeBytes(data)
+                      }
+                      "sra" -> {
+                          if (data.size != 32768) return "Arquivo .sra com tamanho inesperado (${data.size} bytes). Esperado 32768."
+                          File(dir, g.saveKey + ".sra").writeBytes(data)
+                      }
+                      "fla" -> {
+                          if (data.size != 131072) return "Arquivo .fla com tamanho inesperado (${data.size} bytes). Esperado 131072."
+                          File(dir, g.saveKey + ".fla").writeBytes(data)
+                      }
+                      else -> return "Formato não reconhecido. Use .srm, .eep, .mpk, .sra ou .fla."
+                  }
+                  return "Save importado. Ele será aplicado na próxima vez que você abrir o jogo."
+              }
+
+              fun exportTo(ctx: Context, g: Game, dest: Uri): Boolean {
+                  return try {
+                      val f = file(ctx, g)
+                      if (!f.exists()) return false
+                      ctx.contentResolver.openOutputStream(dest)?.use { o -> f.inputStream().use { it.copyTo(o) } } != null
+                  } catch (e: Exception) {
+                      false
+                  }
+              }
+
+              fun delete(ctx: Context, g: Game) {
+                  file(ctx, g).delete()
+                  File(Storage.savesDir(ctx), g.saveKey + ".srm.bak").delete()
+                  pending(ctx, g).forEach { it.delete() }
+              }
+          }
+          N64EMU_EOF
+          cat > app/src/main/java/dev/n64emu/app/SavesTab.kt <<'N64EMU_EOF'
+          package dev.n64emu.app
+
+          import android.net.Uri
+          import android.text.format.Formatter
+          import android.widget.LinearLayout
+          import android.widget.ScrollView
+          import android.widget.Toast
+          import androidx.appcompat.app.AlertDialog
+          import java.text.SimpleDateFormat
+          import java.util.Date
+          import java.util.Locale
+
+          class SavesTab(private val act: MainActivity) {
+              val view = ScrollView(act)
+              private val col = LinearLayout(act)
+              private var pickedUri: Uri? = null
+              private var exportGame: Game? = null
+
+              private fun dp(v: Int) = Ui.dp(act, v)
+
+              init {
+                  col.orientation = LinearLayout.VERTICAL
+                  col.setPadding(dp(12), dp(12), dp(12), dp(12))
+                  view.addView(col)
+              }
+
+              fun refresh() {
+                  col.removeAllViews()
+                  col.addView(Ui.text(act, "Saves", 26f, bold = true))
+
+                  val imp = Ui.card(act)
+                  imp.addView(Ui.text(act, "Importar save", 18f, bold = true))
+                  imp.addView(Ui.text(act, "Aceita .srm (de outro app com o mesmo núcleo), .eep, .mpk, .sra e .fla. Depois você escolhe para qual jogo.", 13f, Ui.SUB))
+                  imp.addView(Ui.button(act, "Escolher arquivo de save") { act.pickSave.launch(arrayOf("*/*")) })
+                  col.addView(imp)
+
+                  val games = act.library.games
+                  if (games.isEmpty()) {
+                      val t = Ui.text(act, "Adicione um jogo na aba Jogos para ver os saves dele aqui.", 14f, Ui.SUB)
+                      t.setPadding(0, dp(8), 0, dp(8))
+                      col.addView(t)
+                  }
+                  val fmt = SimpleDateFormat("dd/MM/yyyy HH:mm", Locale.getDefault())
+                  for (g in games) {
+                      val card = Ui.card(act)
+                      card.addView(Ui.text(act, g.title, 16f, bold = true))
+                      val f = Saves.file(act, g)
+                      val status = when {
+                          f.exists() -> "Save de ${Formatter.formatShortFileSize(act, f.length())} · ${fmt.format(Date(f.lastModified()))}"
+                          Saves.hasPending(act, g) -> "Save importado, será aplicado ao abrir o jogo"
+                          else -> "Sem save ainda"
+                      }
+                      card.addView(Ui.text(act, status, 13f, Ui.SUB))
+                      val row = LinearLayout(act)
+                      row.orientation = LinearLayout.HORIZONTAL
+                      row.setPadding(0, dp(8), 0, 0)
+                      val lp = { LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f) }
+                      row.addView(Ui.button(act, "Importar") { pickFor(g) }, lp())
+                      if (f.exists()) {
+                          row.addView(Ui.button(act, "Exportar") {
+                              exportGame = g
+                              act.createSave.launch(g.saveKey + ".srm")
+                          }, lp())
+                      }
+                      if (f.exists() || Saves.hasPending(act, g)) {
+                          row.addView(Ui.button(act, "Apagar") {
+                              AlertDialog.Builder(act)
+                                  .setTitle("Apagar o save de ${g.title}?")
+                                  .setMessage("Isso não pode ser desfeito. Exporte antes se quiser guardar uma cópia.")
+                                  .setPositiveButton("Apagar") { _, _ -> Saves.delete(act, g); refresh() }
+                                  .setNegativeButton("Cancelar", null)
+                                  .show()
+                          }, lp())
+                      }
+                      card.addView(row)
+                      col.addView(card)
+                  }
+
+                  val manual = Ui.card(act)
+                  manual.addView(Ui.text(act, "Pasta dos saves", 18f, bold = true))
+                  manual.addView(Ui.text(act, "Cada jogo usa o arquivo NOME.srm nesta pasta. Se preferir, copie o save direto para lá com o jogo fechado.", 13f, Ui.SUB))
+                  val path = Ui.text(act, Storage.savesDir(act).absolutePath + "/", 12f, Ui.SUB)
+                  path.setTextIsSelectable(true)
+                  manual.addView(path)
+                  col.addView(manual)
+              }
+
+              /** Chamado pela MainActivity quando o usuário escolheu um arquivo de save. */
+              fun onSavePicked(uri: Uri) {
+                  pickedUri = uri
+                  val games = act.library.games
+                  if (games.isEmpty()) {
+                      Toast.makeText(act, "Adicione um jogo primeiro na aba Jogos.", Toast.LENGTH_LONG).show()
+                      return
+                  }
+                  AlertDialog.Builder(act)
+                      .setTitle("Save para qual jogo?")
+                      .setItems(games.map { it.title }.toTypedArray()) { _, i -> importInto(games[i]) }
+                      .show()
+              }
+
+              /** Arquivo escolhido pelo botão "Importar" de um jogo específico. */
+              fun onSavePickedFor(uri: Uri, g: Game) {
+                  pickedUri = uri
+                  importInto(g)
+              }
+
+              private fun pickFor(g: Game) {
+                  // atalho: o botão "Importar" do cartão já define o jogo, o arquivo é escolhido em seguida
+                  act.saveTargetGame = g
+                  act.pickSave.launch(arrayOf("*/*"))
+              }
+
+              fun importInto(g: Game) {
+                  val uri = pickedUri ?: return
+                  val msg = Saves.importFrom(act, uri, g)
+                  Toast.makeText(act, msg, Toast.LENGTH_LONG).show()
+                  refresh()
+              }
+
+              fun onExportTo(dest: Uri) {
+                  val g = exportGame ?: return
+                  val ok = Saves.exportTo(act, g, dest)
+                  Toast.makeText(act, if (ok) "Save exportado." else "Não consegui exportar o save.", Toast.LENGTH_LONG).show()
+              }
+          }
+          N64EMU_EOF
+          cat > app/src/main/res/drawable/ic_launcher_foreground.xml <<'N64EMU_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="108dp"
+              android:height="108dp"
+              android:viewportWidth="108"
+              android:viewportHeight="108">
+              <path
+                  android:pathData="M46,32 L28,32 L28,76 L46,76 L46,54 L28,54"
+                  android:fillColor="#00000000"
+                  android:strokeColor="#FF3B30"
+                  android:strokeWidth="8"
+                  android:strokeLineCap="square"
+                  android:strokeLineJoin="miter" />
+              <path
+                  android:pathData="M58,32 L58,54 L82,54"
+                  android:fillColor="#00000000"
+                  android:strokeColor="#34C759"
+                  android:strokeWidth="8"
+                  android:strokeLineCap="square"
+                  android:strokeLineJoin="miter" />
+              <path
+                  android:pathData="M76,32 L76,76"
+                  android:fillColor="#00000000"
+                  android:strokeColor="#0A84FF"
+                  android:strokeWidth="8"
+                  android:strokeLineCap="square" />
+              <path
+                  android:pathData="M30,84 L78,84"
+                  android:fillColor="#00000000"
+                  android:strokeColor="#FFD60A"
+                  android:strokeWidth="4"
+                  android:strokeLineCap="round" />
+          </vector>
+          N64EMU_EOF
+          cat > app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml <<'N64EMU_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+              <background android:drawable="@color/ic_bg" />
+              <foreground android:drawable="@drawable/ic_launcher_foreground" />
+          </adaptive-icon>
+          N64EMU_EOF
+          cat > app/src/main/res/values/colors.xml <<'N64EMU_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <color name="ic_bg">#14162B</color>
+          </resources>
+          N64EMU_EOF
+          cat > app/src/main/res/values/strings.xml <<'N64EMU_EOF'
+          <resources><string name="app_name">64exem</string></resources>
+          N64EMU_EOF
+          cat > build.gradle.kts <<'N64EMU_EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          N64EMU_EOF
+          cat > gradle.properties <<'N64EMU_EOF'
+          org.gradle.jvmargs=-Xmx2g
+          android.useAndroidX=true
+          N64EMU_EOF
+          cat > settings.gradle.kts <<'N64EMU_EOF'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "N64Emu"
+          include(":app")
+          N64EMU_EOF
+      - name: Baixar núcleo N64 (GLideN64) e libretro.h
+        run: |
+          set -e
+          mkdir -p app/src/main/jniLibs/arm64-v8a app/src/main/cpp/include
+          curl -fL -o core.zip https://buildbot.libretro.com/nightly/android/latest/arm64-v8a/mupen64plus_next_gles3_libretro_android.so.zip
+          unzip -o core.zip -d core_tmp
+          cp core_tmp/*.so app/src/main/jniLibs/arm64-v8a/libmupen_core.so
+          curl -fL -o app/src/main/cpp/include/libretro.h https://raw.githubusercontent.com/libretro/libretro-common/master/include/libretro.h
+          CORE=app/src/main/jniLibs/arm64-v8a/libmupen_core.so
+          echo "== dependencias do nucleo =="
+          readelf -d "$CORE" | grep NEEDED || true
+          if readelf -d "$CORE" | grep -q 'libc++_shared.so'; then
+            echo "nucleo precisa de libc++_shared.so: copiando do NDK"
+            STL=$(find "$ANDROID_HOME/ndk" -path '*aarch64-linux-android/libc++_shared.so' | head -n 1)
+            cp "$STL" app/src/main/jniLibs/arm64-v8a/
+          fi
+          ls -la app/src/main/jniLibs/arm64-v8a
+      - name: Build APK debug
+        run: gradle --no-daemon --stacktrace assembleDebug
+      - uses: actions/upload-artifact@v4
+        with:
+          name: 64exem-debug
+          path: app/build/outputs/apk/debug/*.apk
